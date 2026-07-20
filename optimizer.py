@@ -64,17 +64,26 @@ def _rng_save(state: dict, rng: np.random.Generator) -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 파일 교환 셸 (x.txt) — optimizer 가 소유하는 프로세스 간 교환 형식.
+# 파일 교환 셸 — optimizer 가 소유하는 프로세스 간 교환 형식.
 # 주의: 이 계층은 진입부(셸) 전용이다. OptimizerBase 와 알고리즘 클래스의
 # ask/tell 은 파일의 존재를 모르는 순수 함수로 유지한다.
 #
-# 형식:
+# [x.txt — 나가는 쪽, 우리가 형식을 소유]
 #     # eval_index=123
 #     [15,0,0,0,-1,-3,5,3]
 #     [-15,0,3,0,-1,3,2,9]
 # - 1행 헤더 = 이 배치 첫 평가의 전역 카운터 (노이즈 시딩·대응 검증용)
 # - 2행부터 한 줄 = 해 하나 (signed 정수, 텍스트 왕복 무손실)
-# 규율: 원자적 쓰기(tmp + os.replace), fail-loud(형식/범위 위반 즉시 raise).
+#
+# [y_raw.bin — 들어오는 쪽, 내부 구조를 우리가 통제하지 못하는 불투명 바이너리]
+# 실제 문제의 bin 레이아웃은 생산자(calculator) 소관이라 달라질 수 있다.
+# 대응 지점을 두 함수로 고정한다 — 레이아웃이 바뀌면 **이 둘만 교체**하고,
+# 하류(tell 이후 파이프라인)는 불변:
+#     read_y_raw(path)   : bin 디코딩 → (원형 배열, eval_index)
+#     convert_y_raw(Yf)  : 원형 → 표준 (b, K) float64  ← y_raw→y 변환 이음새
+# 레퍼런스 기본 레이아웃: int64 eval_index, int64 b, int64 K, float64×(b·K) (LE).
+#
+# 규율: 원자적 쓰기(tmp + os.replace), fail-loud(형식/범위/NaN 위반 즉시 raise).
 # ──────────────────────────────────────────────────────────────────────────────
 
 def write_x(path: str | Path, X: np.ndarray, eval_index: int) -> None:
@@ -132,6 +141,59 @@ def read_x(path: str | Path, space: SearchSpace | None = None) -> tuple[np.ndarr
                 f"[{space.x_min[c]}, {space.x_max[c]}]"
             )
     return X, eval_index
+
+
+def write_y_raw(path: str | Path, Y: np.ndarray, eval_index: int) -> None:
+    """레퍼런스 y_raw.bin 작성기 (calculator 측 기본 레이아웃).
+
+    레이아웃: int64 eval_index, int64 b, int64 K, 이어서 float64×(b·K)
+    (전부 little-endian). 실제 시스템의 calculator 가 다른 레이아웃을 쓰면
+    이 함수가 아니라 read_y_raw/convert_y_raw 쪽을 교체한다.
+    """
+    Y = np.ascontiguousarray(np.atleast_2d(Y), dtype="<f8")
+    path = Path(path)
+    header = np.array([int(eval_index), Y.shape[0], Y.shape[1]], dtype="<i8")
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_bytes(header.tobytes() + Y.tobytes())
+    os.replace(tmp, path)  # 원자적 교체
+
+
+def read_y_raw(path: str | Path) -> tuple[np.ndarray, int]:
+    """y_raw.bin 디코딩 → (원형 배열, eval_index). 레이아웃 위반은 즉시 raise.
+
+    ⚠️ 교체 지점 ①: 실제 문제의 bin 내부 구조가 다르면 이 함수를 그 레이아웃에
+    맞게 갈아끼운다. 반환 계약만 지키면 하류는 불변이다.
+    """
+    buf = Path(path).read_bytes()
+    if len(buf) < 24:
+        raise ValueError(f"{path}: 헤더(24바이트)보다 짧음 — {len(buf)}바이트")
+    eval_index, b, k = (int(v) for v in np.frombuffer(buf[:24], dtype="<i8"))
+    if b < 1 or k < 1:
+        raise ValueError(f"{path}: 헤더 손상 — b={b}, K={k}")
+    expected = 24 + 8 * b * k
+    if len(buf) != expected:
+        raise ValueError(f"{path}: 크기 불일치 — {len(buf)} ≠ {expected} (b={b}, K={k})")
+    Y = np.frombuffer(buf[24:], dtype="<f8").reshape(b, k)
+    return Y, eval_index
+
+
+def convert_y_raw(Y_file: np.ndarray, n_obj: int | None = None) -> np.ndarray:
+    """y_raw(파일 원형) → 표준 (b, K) float64 — **y_raw→y 변환 이음새**.
+
+    ⚠️ 교체 지점 ②: 실제 문제에서 목적 배치/단위/인코딩이 다르면 이 함수만
+    수정한다 (예: 컬럼 재배열, 파생 목적 계산). 기본 구현은 항등 + 검증.
+    출력 계약: (b, K) float64, 전 원소 유한(finite). NaN/inf 는 즉시 raise —
+    조용한 대체 금지.
+    """
+    Y = np.atleast_2d(np.asarray(Y_file, dtype=np.float64))
+    if Y.ndim != 2:
+        raise ValueError(f"y_raw 는 2차원이어야 함: {Y.shape}")
+    if n_obj is not None and Y.shape[1] != n_obj:
+        raise ValueError(f"목적 수 불일치 — {Y.shape[1]} ≠ 기대 {n_obj}")
+    if not np.isfinite(Y).all():
+        r, c = map(int, np.argwhere(~np.isfinite(Y))[0])
+        raise ValueError(f"y_raw 에 비유한값 — 행 {r} 목적 {c}: {Y[r, c]}")
+    return Y
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1636,3 +1698,26 @@ if __name__ == "__main__":
             else:
                 raise AssertionError(f"raise 됐어야 함: {content!r}")
     print(f"[OK] {'x.txt 셸':>16s} — 왕복 무손실 ({X.shape}), fail-loud 4종 통과")
+
+    # y_raw.bin 셸 점검: 왕복 + convert 이음새 + fail-loud
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "y_raw.bin"
+        Y = rng.normal(0, 1, (10, n_obj)) * np.array([9e3, 1.1, 5e-3, 9e3, 1.1, 5e-3])
+        write_y_raw(p, Y, eval_index=123)
+        Yf, idx = read_y_raw(p)
+        Y2 = convert_y_raw(Yf, n_obj=n_obj)
+        assert np.array_equal(Y, Y2) and idx == 123  # float64 비트 단위 왕복
+        p.write_bytes(p.read_bytes()[:-8])  # 잘린 파일 → raise
+        try:
+            read_y_raw(p)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("잘린 y_raw.bin 은 raise 됐어야 함")
+        try:
+            convert_y_raw(np.array([[1.0, np.nan]]))  # NaN → raise
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("NaN 은 raise 됐어야 함")
+    print(f"[OK] {'y_raw.bin 셸':>16s} — 왕복 비트 동일, convert 이음새, fail-loud 통과")
