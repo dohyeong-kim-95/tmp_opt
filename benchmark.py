@@ -597,6 +597,83 @@ def make_all_plots(
     print(f"\nvis/ 에 그림 저장 완료: {sorted(p.name for p in VIS_DIR.glob('*.png'))}")
 
 
+def plot_best_observations(
+    benchmark_name: str,
+    budget: int,
+    scorer_name: str,
+    seed: int = 0,
+) -> None:
+    """budget 소진 후 각 optimizer 의 best 해가 만든 **관측 원형**을 그린다.
+
+    각 패널 = optimizer 하나: best X 를 무노이즈 재평가한 타원 마스크 2장
+    (배경 + optimizer 고정색 2톤) + 측정치(y11×y12, y21×y22)와 스칼라
+    (y13, y23) 주석. 패널은 pooled 점수 내림차순 — 좋은 해일수록 타원이
+    크고(y11·y12·y21·y22 최대화) 스칼라가 작아야(y13·y23 최소화) 한다.
+    """
+    print(f"[Best-obs] {benchmark_name} — {len(OPTIMIZER_COLORS)} optimizers × "
+          f"budget {budget}, seed={seed}")
+    runs = [run_single(name, benchmark_name, seed, budget, scorer_name)
+            for name in OPTIMIZER_COLORS]
+    scaler = fit_pooled_scaler(runs)
+    calc = BENCHMARKS[benchmark_name](noise_seed=0)
+
+    entries = []
+    for r in runs:
+        ps = pooled_scores(r, scaler, scorer_name)
+        i = int(np.argmax(ps))
+        raw = calc.evaluate(r.X[i], noisy=False)  # best 해의 관측 원형 (무노이즈)
+        y = convert_y_raw(raw)[0]                 # (6,) 측정치
+        entries.append((r.optimizer, float(ps[i]), raw, y))
+    entries.sort(key=lambda e: -e[1])  # 점수 내림차순 — 시각적 랭킹
+
+    from matplotlib.colors import ListedColormap
+
+    n = len(entries)
+    ncols, nrows = 3, int(np.ceil(n / 3))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(11, 3.4 * nrows), dpi=150)
+    axes = np.atleast_2d(axes)
+    gap = 10  # 두 마스크 사이 배경색 간격 (px)
+
+    for k, (name, score, raw, y) in enumerate(entries):
+        ax = axes[k // ncols][k % ncols]
+        m1, m2 = raw["mask1"][0], raw["mask2"][0]
+        g = m1.shape[0]
+        img = np.concatenate(
+            [m1, np.zeros((g, gap), dtype=bool), m2], axis=1).astype(float)
+        # 2톤: 중립 배경 + optimizer 고정색 (색은 entity 를 따른다 — 재배색 금지)
+        ax.imshow(img, cmap=ListedColormap(["#f2f2f2", OPTIMIZER_COLORS[name]]),
+                  interpolation="nearest", aspect="equal")
+        ax.set_title(f"#{k + 1}  {name}  ·  score {score:.3f}",
+                     fontsize=10, color="#222222")
+        # 측정치/스칼라 주석 — 텍스트는 잉크색 (마크 색 사용 금지)
+        ax.text(0.25, -0.06, f"y11×y12 = {y[0]:.0f}×{y[1]:.0f}",
+                transform=ax.transAxes, ha="center", va="top",
+                fontsize=8.5, color="#333333")
+        ax.text(0.75, -0.06, f"y21×y22 = {y[3]:.0f}×{y[4]:.0f}",
+                transform=ax.transAxes, ha="center", va="top",
+                fontsize=8.5, color="#333333")
+        ax.text(0.5, -0.17, f"y13 = {y[2]:.4g}   ·   y23 = {y[5]:.4g}",
+                transform=ax.transAxes, ha="center", va="top",
+                fontsize=8.5, color="#555555")
+        ax.set_xticks([])
+        ax.set_yticks([])
+        for side in ax.spines.values():
+            side.set_visible(False)
+    for k in range(n, nrows * ncols):  # 남는 칸은 비운다
+        axes[k // ncols][k % ncols].axis("off")
+
+    fig.suptitle(
+        f"Best observation after budget {budget} on {benchmark_name} "
+        f"(seed {seed}, pooled {scorer_name})\n"
+        "ellipses (y11·y12 / y21·y22): larger = better  ·  "
+        "scalars (y13·y23): smaller = better",
+        fontsize=11, y=0.995)  # (한글은 기본 matplotlib 폰트에 없어 영문 표기)
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    fig.savefig(VIS_DIR / f"best_obs_{benchmark_name}.png")
+    plt.close(fig)
+    print(f"저장: vis/best_obs_{benchmark_name}.png")
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # 7) matrix 모드 — 난이도 요인별 벤치마크 × optimizer 격자 비교
 # ──────────────────────────────────────────────────────────────────────────────
@@ -661,6 +738,9 @@ def main() -> None:
                              "전체 optimizer 격자 비교 (예: bm3_hard,bm4_deceptive)")
     parser.add_argument("--seeds", type=int, default=5,
                         help="--matrix 모드의 벤치마크당 seed 수 (기본 5)")
+    parser.add_argument("--best-obs", type=str, default=None,
+                        help="각 optimizer 의 budget 소진 후 best 해의 관측 원형"
+                             "(타원 마스크 2장 + 스칼라 2개)을 그린다 (벤치마크 이름)")
     args = parser.parse_args()
 
     budget = 120 if args.smoke else args.budget
@@ -675,6 +755,10 @@ def main() -> None:
 
     if args.polish_true_optimum:  # 참조값 폴리시 (실험 없이 참조만 갱신)
         polish_true_optimum(args.scorer)
+        return
+
+    if args.best_obs:  # best 해의 관측 원형 시각화
+        plot_best_observations(args.best_obs, budget, args.scorer)
         return
 
     if args.matrix:  # 난이도 요인별 격자 비교 모드
