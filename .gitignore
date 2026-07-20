@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+results_full_run.log
+rerun.log
+matrix.log
+results/
+vis/
