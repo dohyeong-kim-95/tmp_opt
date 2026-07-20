@@ -563,6 +563,80 @@ def plot_top3(top3: dict) -> None:
     plt.close(fig)
 
 
+def plot_shmoo(
+    benchmark_name: str,
+    budget: int,
+    optimizer_name: str = "xgb_tr",
+    seed: int = 0,
+) -> None:
+    """한 optimizer 의 budget 소진 후 best 해의 **관측 마스크(bool 2D array)를
+    상세히** 그린다 — shmoo plot.
+
+    핵심: 마스크는 저장할 필요가 없다. best 해의 X 는 history 에 있고,
+    calculator 는 X 에 대해 결정적이므로 재평가로 복원한다 (true-optimum·
+    anytime 곡선과 동일한 post-hoc 원리):
+      - 무노이즈 재평가 → 참 타원 모양 ("이 해가 실제로 어떻게 생겼나")
+      - 노이즈 재평가   → 경계 flip 이 만드는 shmoo 특유의 너덜한 경계
+    각 패널에 max-height / max-width 측정 현(chord)을 겹쳐 y11..y22 가
+    어떻게 뽑히는지 보인다.
+    """
+    print(f"[Shmoo] {optimizer_name} on {benchmark_name} — budget {budget}, seed {seed}")
+    r = run_single(optimizer_name, benchmark_name, seed, budget)
+    scaler = fit_pooled_scaler([r])
+    i = int(np.argmax(pooled_scores(r, scaler, "chebyshev")))
+    best_x = r.X[i]
+
+    calc = BENCHMARKS[benchmark_name](noise_seed=seed)
+    clean = calc.evaluate(best_x, noisy=False)  # 참 모양 (X 만으로 복원)
+    noisy = calc.evaluate(best_x, noisy=True)   # 노이즈 관측 예시 (경계 flip)
+
+    from matplotlib.colors import ListedColormap
+    color = OPTIMIZER_COLORS[optimizer_name]
+    cmap = ListedColormap(["#f2f2f2", color])
+
+    panels = [  # (제목, 마스크, y_height 이름, y_width 이름)
+        ("mask1 · true", clean["mask1"][0], "y11", "y12"),
+        ("mask1 · noisy", noisy["mask1"][0], "y11", "y12"),
+        ("mask2 · true", clean["mask2"][0], "y21", "y22"),
+        ("mask2 · noisy", noisy["mask2"][0], "y21", "y22"),
+    ]
+    fig, axes = plt.subplots(2, 2, figsize=(8.5, 8.8), dpi=150)
+    for ax, (title, m, hname, wname) in zip(axes.flat, panels):
+        g = m.shape[0]
+        ax.imshow(m.astype(float), cmap=cmap, interpolation="nearest",
+                  aspect="equal", origin="lower")
+        # 측정 현: max-height = True 가장 많은 열, max-width = True 가장 많은 행
+        col_counts = m.sum(axis=0)  # (g,) 열별 True 수
+        row_counts = m.sum(axis=1)  # (g,) 행별 True 수
+        hc, h = int(np.argmax(col_counts)), int(col_counts.max())
+        wr, w = int(np.argmax(row_counts)), int(row_counts.max())
+        rows_true = np.flatnonzero(m[:, hc])
+        cols_true = np.flatnonzero(m[wr, :])
+        if len(rows_true):  # 세로 현 (height 측정)
+            ax.plot([hc, hc], [rows_true.min(), rows_true.max()],
+                    color="#222222", lw=2, solid_capstyle="round")
+        if len(cols_true):  # 가로 현 (width 측정)
+            ax.plot([cols_true.min(), cols_true.max()], [wr, wr],
+                    color="#222222", lw=2, solid_capstyle="round")
+        ax.set_title(f"{title}   ({hname}={h}, {wname}={w})",
+                     fontsize=10, color="#222222")
+        ax.set_xticks([]); ax.set_yticks([])
+        for s in ax.spines.values():
+            s.set_color("#cccccc")
+
+    fig.suptitle(
+        f"Shmoo plot — best solution masks\n"
+        f"{optimizer_name} on {benchmark_name}, budget {budget}  ·  "
+        "chords = measured max-height / max-width  ·  "
+        "noise = boundary-pixel flips\n"
+        "(masks recovered by re-evaluation from X, not stored)",
+        fontsize=10, y=0.99)
+    fig.tight_layout(rect=(0, 0, 1, 0.92))
+    fig.savefig(VIS_DIR / f"shmoo_{benchmark_name}_{optimizer_name}.png")
+    plt.close(fig)
+    print(f"저장: vis/shmoo_{benchmark_name}_{optimizer_name}.png")
+
+
 def load_results_from_disk() -> dict[str, list[RunResult]]:
     """results/history_*.parquet 에서 RunResult 들을 복원한다 (--plots-only 용).
 
@@ -741,6 +815,11 @@ def main() -> None:
     parser.add_argument("--best-obs", type=str, default=None,
                         help="각 optimizer 의 budget 소진 후 best 해의 관측 원형"
                              "(타원 마스크 2장 + 스칼라 2개)을 그린다 (벤치마크 이름)")
+    parser.add_argument("--shmoo", type=str, default=None,
+                        help="한 optimizer best 해의 관측 마스크 상세 shmoo plot "
+                             "(true vs noisy + 측정 현). 벤치마크 이름")
+    parser.add_argument("--shmoo-opt", type=str, default="xgb_tr",
+                        help="--shmoo 대상 optimizer (기본 xgb_tr)")
     args = parser.parse_args()
 
     budget = 120 if args.smoke else args.budget
@@ -759,6 +838,10 @@ def main() -> None:
 
     if args.best_obs:  # best 해의 관측 원형 시각화
         plot_best_observations(args.best_obs, budget, args.scorer)
+        return
+
+    if args.shmoo:  # best 해의 관측 마스크 상세 shmoo plot
+        plot_shmoo(args.shmoo, budget, args.shmoo_opt)
         return
 
     if args.matrix:  # 난이도 요인별 격자 비교 모드
