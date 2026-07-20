@@ -623,8 +623,45 @@ TOURNAMENT_ORDER: tuple[str, ...] = (
 )
 
 
+def serve_eval(benchmark_name: str, exchange_dir, seed: int) -> int:
+    """프로세스 분리 실행의 calculator 한 스텝: x.txt 읽기 → 평가 → y_raw.bin.
+
+    노이즈는 (seed, eval_index) 로 재시딩해 프로세스 경계와 무관하게 결정적이다
+    (배치 단위 — 같은 eval_index 는 같은 노이즈). 교환 셸 함수(read_x/write_y_raw)는
+    optimizer 소유라 여기서 지연 import 한다 (모듈 순환 회피).
+    """
+    from pathlib import Path
+
+    from optimizer import read_x, write_y_raw
+
+    d = Path(exchange_dir)
+    space = SearchSpace()
+    X, eval_index = read_x(d / "x.txt", space=space)
+    calc = BENCHMARKS[benchmark_name](noise_seed=seed)
+    calc._noise_rng = np.random.default_rng([seed, eval_index])  # 배치 단위 결정적 노이즈
+    raw = calc.evaluate(X)  # noisy=True — 구조화 관측 원형
+    write_y_raw(d / "y_raw.bin", raw, eval_index=eval_index)
+    return len(X)
+
+
 if __name__ == "__main__":
-    # 자가 점검: 공간 크기, 구조화 y_raw 형상, 측정치 스케일, 노이즈 수준.
+    import argparse
+
+    _ap = argparse.ArgumentParser(description="calculator — 자가 점검 또는 프로세스 분리 평가")
+    _ap.add_argument("--serve-eval", action="store_true",
+                     help="파일 기반 프로세스 분리 실행의 calculator 한 스텝")
+    _ap.add_argument("--benchmark", choices=list(BENCHMARKS), default="bm1_easy")
+    _ap.add_argument("--dir", type=str, default=None, help="교환 디렉토리")
+    _ap.add_argument("--seed", type=int, default=0)
+    _args = _ap.parse_args()
+
+    if _args.serve_eval:  # runner 가 서브프로세스로 호출하는 경로
+        assert _args.dir, "--serve-eval 에는 --dir 필요"
+        b = serve_eval(_args.benchmark, _args.dir, _args.seed)
+        print(f"[calc-eval] {_args.benchmark} → {b} evals → y_raw.bin")
+        raise SystemExit(0)
+
+    # 인자 없음 → 자가 점검: 공간 크기, 구조화 y_raw 형상, 측정치 스케일, 노이즈 수준.
     # (측정 변환은 optimizer 소유 — 여기서는 표시용으로만 빌려 쓴다.
     #  __main__ 가드 안 import 라 모듈 순환 없음)
     from optimizer import convert_y_raw

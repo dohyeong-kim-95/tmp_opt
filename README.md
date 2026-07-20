@@ -102,6 +102,19 @@ ask/tell 은 파일의 존재를 모르는 순수 함수로 유지된다. 공통
 **원자적 쓰기**(tmp + `os.replace`), **fail-loud**(형식/범위/정합성 위반 즉시 raise,
 조용한 대체·건너뛰기 금지).
 
+**두 실행 모드**: (1) 기본 `run_single` 은 in-process(함수 호출·배열 전달, 빠름,
+파일 없음 — 체크포인트는 `--checkpoint-dir` 로 opt-in). (2) `--separate DIR` 은
+**프로세스 분리** — runner 가 `optimizer.py --serve-step` 과
+`calculator.py --serve-eval` 을 별도 서브프로세스로 번갈아 spawn 하고, 두
+프로세스는 **공유 메모리가 없으므로** 아래 파일들이 유일한 통신 수단이다.
+실제 문제가 파일 매개 프로세스 분리를 계약으로 요구한다면 이 모드가 그 계약을
+강제한다 — 파일 교환이 실제로 일어나야만 스텝이 진행되므로 in-process 우회가
+물리적으로 불가능하다. optimizer 는 매 스텝 새 프로세스로 뜨며 state.pkl +
+history.jsonl 이 스텝 간 유일한 기억이다. 한 스텝의 핸드셰이크:
+`opt-step`(state 로드 → 직전 y_raw ingest → ask → x.txt·state 저장) →
+`calc-eval`(x.txt 읽기 → 평가 → y_raw.bin) → 반복, 예산 소진 시 `done` 마커.
+(검증 지문: x.txt / y_raw.bin 의 `eval_index` 가 매 라운드 배치 크기만큼 전진.)
+
 | 파일 | 형식 | 방향/성격 | 함수 |
 |---|---|---|---|
 | `x.txt` | 텍스트 | optimizer → calculator. 다음 후보 배치 | `write_x` / `read_x` |
@@ -242,6 +255,9 @@ pip install numpy scipy scikit-learn polars xgboost matplotlib
 python runner.py --optimizer sa --benchmark bm1_easy --seed 0 --budget 800
 python runner.py --optimizer ga --benchmark bm3_hard --checkpoint-dir ckpt/
 #   → ckpt/history.jsonl + ckpt/state.pkl (optimizer.load_state 로 재개 가능)
+python runner.py --optimizer ga --benchmark bm1_easy --budget 780 --separate xchg/
+#   → 프로세스 분리: optimizer/calculator 를 별도 서브프로세스로 띄우고
+#     xchg/ 의 x.txt·y_raw.bin·history.jsonl·state.pkl 로만 통신 (in-process 우회 불가)
 
 # 여러 run 비교 (benchmark.py)
 python benchmark.py                       # 토너먼트 + top-3 + 시각화 (800 evals)

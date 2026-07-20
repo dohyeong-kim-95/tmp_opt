@@ -7,7 +7,14 @@ Agent 가 만든 시스템이 **같은 파일들을 같은 형식으로** 생성
 ## bm1_easy_ga_seed0/
 
 `ga` optimizer × `bm1_easy` × seed 0 × budget 780 의 산출물.
-매 스텝(ask → calculator 평가 → tell)마다 4종 파일을 실제로 쓰고 읽었다.
+**프로세스 분리 실행**으로 생성됐다 — runner 가 optimizer 와 calculator 를
+별도 서브프로세스로 번갈아 띄우고 이 디렉토리의 파일로만 통신했다
+(39 handshake 라운드 = 배치 20 × 39). 재현:
+
+```
+python runner.py --optimizer ga --benchmark bm1_easy --budget 780 \
+                 --separate examples/bm1_easy_ga_seed0
+```
 
 | 파일 | 내용 | 형식 |
 |---|---|---|

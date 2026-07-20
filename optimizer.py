@@ -297,12 +297,20 @@ def load_state(state_path: str | Path, history_path: str | Path,
     """
     with open(state_path, "rb") as f:
         slim = pickle.load(f)
-    X, Y = load_history(history_path, space=space)
     n = slim["n_evals"]
-    if len(X) != n:
-        raise ValueError(
-            f"체크포인트 정합성 위반 — state.pkl n_evals={n} ≠ history.jsonl {len(X)}")
     scores = slim.pop("_scores")
+    n_obj = len(OBJECTIVE_SENSES)
+    if n == 0:
+        # 첫 스텝(아직 관측 0) — history.jsonl 이 없을 수 있으므로 읽지 않는다.
+        if space is None:
+            raise ValueError("n_evals=0 상태 로드에는 space 가 필요하다 (버퍼 폭)")
+        X = np.empty((0, space.n_cols), dtype=np.int64)
+        Y = np.empty((0, n_obj), dtype=np.float64)
+    else:
+        X, Y = load_history(history_path, space=space)
+        if len(X) != n:
+            raise ValueError(
+                f"체크포인트 정합성 위반 — state.pkl n_evals={n} ≠ history.jsonl {len(X)}")
     if len(scores) != n:
         raise ValueError(f"점수 캐시 길이 {len(scores)} ≠ n_evals {n}")
 
@@ -365,6 +373,67 @@ def convert_y_raw(Y_raw, n_obj: int | None = None) -> np.ndarray:
         r, c = map(int, np.argwhere(~np.isfinite(Y))[0])
         raise ValueError(f"y_raw 에 비유한값 — 행 {r} 목적 {c}: {Y[r, c]}")
     return Y
+
+
+# ─── 프로세스 분리 실행: optimizer 한 스텝 (매 호출 = 새 프로세스) ─────────────
+#
+# 파일 기반 계약의 optimizer 측. runner 가 이 함수를 서브프로세스로 반복 호출하고,
+# calculator 는 별도 프로세스로 y_raw.bin 을 채운다. 두 프로세스는 **공유 메모리가
+# 없으므로** state.pkl + history.jsonl 이 스텝 간 유일한 기억이다 (in-process
+# 우회가 구조적으로 불가능 — 파일이 유일한 통신 수단).
+#
+# 교환 디렉토리 파일:
+#   x.txt        optimizer→calculator 다음 후보 (매 스텝 덮어씀)
+#   y_raw.bin    calculator→optimizer 직전 x 의 관측 (매 스텝 덮어씀)
+#   history.jsonl / state.pkl   optimizer 의 지속 상태
+#   done         예산 소진 시 optimizer 가 남기는 종료 마커
+# ──────────────────────────────────────────────────────────────────────────────
+
+def serve_step(optimizer_name: str, exchange_dir: str | Path,
+               seed: int, budget: int) -> str:
+    """optimizer 한 스텝: 상태 로드 → (직전 y_raw 있으면) tell → ask → 저장.
+
+    반환: "proposed"(x.txt 새로 씀) 또는 "done"(예산 소진, done 마커 씀).
+    """
+    d = Path(exchange_dir)
+    space = SearchSpace()
+    opt = OPTIMIZERS[optimizer_name](space, total_budget=budget)
+    assert opt.name == optimizer_name, \
+        f"dispatch 불일치: 요청 {optimizer_name!r} → 생성 {opt.name!r}"
+    st_p, hist_p = d / "state.pkl", d / "history.jsonl"
+    x_p, y_p, done_p = d / "x.txt", d / "y_raw.bin", d / "done"
+
+    if st_p.exists():
+        state = load_state(st_p, hist_p, space=space)
+    else:
+        state = opt.init_state(seed)  # 첫 스텝
+
+    n = state["n_evals"]
+    # 직전 제안(x.txt)에 대한 응답(y_raw.bin)이 있으면 ingest
+    if y_p.exists():
+        raw, y_idx = read_y_raw(y_p)
+        if y_idx == n:  # 우리가 마지막에 낸 배치에 대한 fresh 응답
+            X_last, x_idx = read_x(x_p, space=space)
+            if x_idx != n:
+                raise ValueError(f"대응 위반: x.txt idx={x_idx} ≠ 기대 {n}")
+            state = opt.tell(state, X_last, raw)
+            append_history(hist_p, X_last,
+                           state["Y_raw_hist"][n:state["n_evals"]], eval_index=n)
+            n = state["n_evals"]
+        elif y_idx > n:
+            raise ValueError(f"y_raw.bin idx={y_idx} > n_evals={n} — 손상")
+        # y_idx < n: 이미 소비됨 (엄격 순서면 발생 안 함)
+
+    if n >= budget:  # 예산 소진 → 종료 마커
+        save_state(st_p, state)
+        done_p.write_text(f"n_evals={n}\n")
+        return "done"
+
+    batch, state = opt.ask(state)
+    batch = batch[: budget - n]  # 예산 초과분 절단
+    write_x(x_p, batch, eval_index=n)
+    save_state(st_p, state)
+    return "proposed"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1819,7 +1888,24 @@ OPTIMIZERS: dict[str, type[OptimizerBase]] = {
 
 
 if __name__ == "__main__":
-    # 간단한 자가 점검: 모든 optimizer 가 ask-tell 사이클을 돌 수 있는지 확인.
+    import argparse
+
+    _ap = argparse.ArgumentParser(description="optimizer — 자가 점검 또는 프로세스 분리 스텝")
+    _ap.add_argument("--serve-step", action="store_true",
+                     help="파일 기반 프로세스 분리 실행의 optimizer 한 스텝을 수행")
+    _ap.add_argument("--optimizer", choices=list(OPTIMIZERS), default="random")
+    _ap.add_argument("--dir", type=str, default=None, help="교환 디렉토리")
+    _ap.add_argument("--seed", type=int, default=0)
+    _ap.add_argument("--budget", type=int, default=780)
+    _args = _ap.parse_args()
+
+    if _args.serve_step:  # runner 가 서브프로세스로 호출하는 경로
+        assert _args.dir, "--serve-step 에는 --dir 필요"
+        result = serve_step(_args.optimizer, _args.dir, _args.seed, _args.budget)
+        print(f"[opt-step] {_args.optimizer} → {result}")
+        raise SystemExit(0)
+
+    # 인자 없음 → 자가 점검: 모든 optimizer 가 ask-tell 사이클을 돌 수 있는지 확인.
     # (진짜 벤치마크 대신 임의 raw 관측을 tell 해도 인터페이스는 성립해야 한다)
     import pickle
 

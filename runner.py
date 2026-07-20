@@ -18,6 +18,8 @@
 from __future__ import annotations
 
 import argparse
+import subprocess
+import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -25,8 +27,11 @@ from pathlib import Path
 import numpy as np
 
 from calculator import BENCHMARKS
-from optimizer import OPTIMIZERS, OptimizerBase, SCORERS, append_history, save_state
+from optimizer import (OPTIMIZERS, OptimizerBase, SCORERS, append_history,
+                       load_history, save_state)
 from space import SearchSpace
+
+_HERE = Path(__file__).resolve().parent
 
 
 @dataclass
@@ -104,6 +109,59 @@ def run_single(
     )
 
 
+def run_separated(
+    optimizer_name: str,
+    benchmark_name: str,
+    seed: int,
+    budget: int,
+    exchange_dir: Path,
+    verbose: bool = True,
+) -> RunResult:
+    """**프로세스 분리** 실행 — optimizer 와 calculator 를 별도 서브프로세스로
+    번갈아 띄우고 교환 디렉토리의 파일(x.txt / y_raw.bin)로만 통신한다.
+
+    두 프로세스는 공유 메모리가 없으므로 in-process 우회가 물리적으로 불가능하다
+    — 파일 교환이 실제로 일어나야만 한 스텝이 진행된다. runner 는 순서만 강제:
+        opt-step (x.txt 쓰거나 done) → calc-eval (y_raw.bin 씀) → 반복
+
+    한 handshake 라운드 = optimizer 배치 하나. dispatch/배선은 서브프로세스
+    exit code + done 마커로 강제된다.
+    """
+    d = Path(exchange_dir)
+    d.mkdir(parents=True, exist_ok=True)
+    for f in ("state.pkl", "history.jsonl", "x.txt", "y_raw.bin", "done"):
+        (d / f).unlink(missing_ok=True)
+
+    opt_cmd = [sys.executable, str(_HERE / "optimizer.py"), "--serve-step",
+               "--optimizer", optimizer_name, "--dir", str(d),
+               "--seed", str(seed), "--budget", str(budget)]
+    calc_cmd = [sys.executable, str(_HERE / "calculator.py"), "--serve-eval",
+                "--benchmark", benchmark_name, "--dir", str(d), "--seed", str(seed)]
+
+    t0 = time.perf_counter()
+    rounds = 0
+    while True:
+        subprocess.run(opt_cmd, check=True, cwd=_HERE,
+                       capture_output=not verbose)
+        if (d / "done").exists():
+            break
+        subprocess.run(calc_cmd, check=True, cwd=_HERE,
+                       capture_output=not verbose)
+        rounds += 1
+        if rounds > budget + 5:  # 안전장치 (batch=1 이라도 budget 라운드면 끝)
+            raise RuntimeError("handshake 라운드가 예산을 초과 — 진행 안 됨")
+
+    # 산출물(history.jsonl)에서 결과 복원 — runner 는 optimizer 내부 상태를 안 본다
+    X, Y = load_history(d / "history.jsonl", space=SearchSpace())
+    assert len(X) == budget, f"history 길이 {len(X)} ≠ 예산 {budget}"
+    if verbose:
+        print(f"[separated] {optimizer_name} on {benchmark_name}: "
+              f"{rounds} handshake 라운드, {len(X)} evals, "
+              f"{time.perf_counter() - t0:.1f}s")
+    return RunResult(optimizer_name, benchmark_name, seed, X, Y,
+                     time.perf_counter() - t0)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="단일 run 실행기 (여러 run 비교/시각화는 benchmark.py)"
@@ -117,7 +175,17 @@ def main() -> None:
                         help="optimizer 내부 scalarization (기본 chebyshev)")
     parser.add_argument("--checkpoint-dir", type=Path, default=None,
                         help="매 tell 후 history.jsonl + state.pkl 을 기록할 디렉토리")
+    parser.add_argument("--separate", type=Path, default=None, metavar="DIR",
+                        help="프로세스 분리 실행 — optimizer/calculator 를 별도 "
+                             "서브프로세스로 띄우고 지정 디렉토리의 파일로만 통신")
     args = parser.parse_args()
+
+    if args.separate is not None:  # 파일 기반 프로세스 분리 실행
+        r = run_separated(args.optimizer, args.benchmark, args.seed,
+                          args.budget, args.separate)
+        print(f"{r.optimizer} on {r.benchmark} seed={r.seed}: "
+              f"{len(r.X)} evals via 파일 교환 ({args.separate})")
+        return
 
     r = run_single(args.optimizer, args.benchmark, args.seed, args.budget,
                    args.scorer, args.checkpoint_dir)
