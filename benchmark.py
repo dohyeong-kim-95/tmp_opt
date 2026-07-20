@@ -36,7 +36,7 @@ import numpy as np
 import polars as pl
 
 from calculator import BENCHMARKS, OBJECTIVE_NAMES, TOURNAMENT_ORDER
-from optimizer import OPTIMIZERS, SCORERS, RobustScaler
+from optimizer import OPTIMIZERS, SCORERS, RobustScaler, convert_y_raw
 from runner import RunResult, run_single
 from space import SearchSpace
 
@@ -219,7 +219,8 @@ def recommend_top3(
     # confirmation: 별도 노이즈 시드의 벤치마크에서 각 후보를 반복 재측정
     calc = BENCHMARKS[benchmark_name](noise_seed=999_999)
     for cand in candidates:
-        Y_rep = np.array([calc.evaluate(cand["x"]) for _ in range(n_confirm)])
+        Y_rep = np.vstack([convert_y_raw(calc.evaluate(cand["x"]))
+                           for _ in range(n_confirm)])
         s_rep = SCORERS[scorer_name](scaler.transform(Y_rep))
         cand["confirm_scores"] = s_rep.tolist()
         cand["confirm_mean"] = float(s_rep.mean())
@@ -276,9 +277,9 @@ def compute_true_optimum(
     while n < n_iters:
         batch, state = opt.ask(state)
         batch = batch[: n_iters - n]
-        # 무노이즈 배치 평가 (참조값 계산 전용 — 순차 평가 가정은 실전 run 에만)
-        Y_new = np.atleast_2d(calc.evaluate(batch, noisy=False))
-        state = opt.tell(state, batch, Y_new)
+        # 무노이즈 배치 평가 (참조값 계산 전용 — 순차 평가 가정은 실전 run 에만).
+        # 구조화 raw 는 tell 내부 convert_y_raw 가 수치화한다.
+        state = opt.tell(state, batch, calc.evaluate(batch, noisy=False))
         n += len(batch)
 
     X_hist, Y_hist = state["X_hist"], state["Y_raw_hist"]
@@ -326,7 +327,7 @@ def polish_true_optimum(scorer_name: str = "chebyshev") -> None:
         scorer = SCORERS[scorer_name]
 
         def f(X):
-            Y = np.atleast_2d(calc.evaluate(np.atleast_2d(X), noisy=False))
+            Y = convert_y_raw(calc.evaluate(np.atleast_2d(X), noisy=False))
             return scorer(scaler.transform(Y))
 
         x = np.asarray(e["best_x"], dtype=np.int64)
@@ -357,7 +358,7 @@ def polish_true_optimum(scorer_name: str = "chebyshev") -> None:
             else:
                 break  # 1-hop·2-swap 모두 개선 불가 → 인증 완료
         e["best_x"] = x.tolist()
-        e["best_y0_noiseless"] = calc.evaluate(x, noisy=False).tolist()
+        e["best_y0_noiseless"] = convert_y_raw(calc.evaluate(x, noisy=False))[0].tolist()
         e["certified"] = "2swap_local_optimum"
         print(f"  [{bm}] {s0:.4f} → {s:.4f} (2-swap 국소최적 인증)")
     path.write_text(json.dumps(entries, indent=2))

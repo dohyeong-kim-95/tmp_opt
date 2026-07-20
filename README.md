@@ -27,9 +27,16 @@ method 들을 비교하는 벤치마크 프레임워크.
   - `set1` (col 10–14) → y11, y12, y13 에만 영향 (유효차원 15, 쉬움)
   - `set2` (col 15–29) → y21, y22, y23 에만 영향 (유효차원 25, 병목)
   - `set1 ⫫ set2 | common`
-- **y0**: 6개 스칼라. 최대화 y11,y12,y21,y22 / 최소화 y13,y23.
-  - j(뒤 숫자)가 같으면 스케일 유사, 다르면 크게 다름. **값 범위 사전 정보 없음.**
-  - 관측 노이즈: 주효과 표준편차의 5% 가우시안.
+- **y_raw (관측 원형)**: 6개 스칼라가 아니라 **구조화 관측**이다 —
+  boolean 타원 마스크 2장 (`mask1`/`mask2`, 각 (b, 128, 128), 가우시안 필드
+  G≥0.5 임계로 렌더) + 스칼라 2개 (`y13`/`y23`).
+  - **y11/y12** = mask1 의 max height / max width, **y21/y22** = mask2 의
+    max height / max width — 측정(마스크→수치)은 optimizer 의
+    `convert_y_raw` 이음새 소관. 최대화 y11,y12,y21,y22 / 최소화 y13,y23.
+  - 스칼라는 j그룹 은닉 스케일 적용, 타원 측정치는 픽셀 단위 —
+    **값 범위 사전 정보 없음** 전제는 동일 (온라인 스케일러가 흡수).
+  - 관측 노이즈: 타원 = **경계 밴드 픽셀 random flip + 격자 양자화**,
+    스칼라 = 주효과 표준편차의 5% 가우시안.
 - **평가**: 병렬 불가(순차), run당 예산 800회. 반복측정은 최종 confirmation에서만.
 
 ## 스케일링 / Scalarization
@@ -108,14 +115,20 @@ ask/tell 은 파일의 존재를 모르는 순수 함수로 유지된다. 공통
 
 **y_raw.bin** — 내부 구조를 우리가 통제하지 못하는 **불투명 바이너리**로 취급.
 실제 문제의 레이아웃이 다르면 교체 지점 두 개만 갈아끼운다 (하류 불변):
-`read_y_raw`(① bin 디코딩) → `convert_y_raw`(② y_raw → 표준 (b, K) float64,
-NaN/inf 즉시 raise). 레퍼런스 레이아웃: int64 `eval_index, b, K` + float64×(b·K), LE.
+`read_y_raw`(① bin 디코딩) → `convert_y_raw`(② 관측 원형 → 표준 (b, K) float64
+— 마스크 측정 + 스칼라 통과, NaN/inf 즉시 raise). 레퍼런스 레이아웃:
+int64 `eval_index, b, G, n_scalar` + uint8 mask1/mask2 (b·G·G씩) +
+float64 y13/y23 (b씩), LE. in-process 경로에서도 같은 이음새를 지난다 —
+`OptimizerBase.tell` 이 구조화 y_raw 를 받아 내부에서 `convert_y_raw` 를 호출.
 
 **history.jsonl** — 한 줄 = tell 한 번:
-`{"eval_index":0,"X":[[...]],"y_raw":[[...]]}`. X 는 정수, y_raw 는 json 의
-shortest-round-trip repr 라 float64 무손실. 사람이 읽고 diff 할 수 있으며
-pkl 없이도 post-hoc 분석(anytime 곡선·pooled 재점수)이 가능하다.
-로드 시 **eval_index 연속성**을 검증해 빠지거나 중복된 batch 를 즉시 잡는다.
+`{"eval_index":0,"X":[[...]],"y_raw":[[...]]}`. y_raw 필드에는 마스크 원형이
+아니라 **변환된 (b, K) 측정치**를 기록한다 (마스크는 용량·가독성 문제로 보존
+안 함 — 변환이 결정적이라 정보 손실은 측정 정의 그 자체뿐). X 는 정수,
+측정치는 json 의 shortest-round-trip repr 라 float64 무손실. 사람이 읽고
+diff 할 수 있으며 pkl 없이도 post-hoc 분석(anytime 곡선·pooled 재점수)이
+가능하다. 로드 시 **eval_index 연속성**을 검증해 빠지거나 중복된 batch 를
+즉시 잡는다.
 
 **state.pkl** — 히스토리를 제외한 나머지 (알고리즘 상태, RNG, 스케일러 파라미터,
 점수 캐시 — 점수는 스케일러 *이력* 에 의존하는 파생 상태라 관측이 아닌 상태로

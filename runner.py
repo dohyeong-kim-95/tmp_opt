@@ -78,13 +78,17 @@ def run_single(
         batch, state = opt.ask(state)
         batch = batch[: budget - n]  # 예산 초과분은 잘라낸다
 
-        # 순차 평가 (실전 가정: 병렬 불가) — 한 행씩 평가해 모은다
-        Y_raw = np.array([calc.evaluate(x) for x in batch])
-        state = opt.tell(state, batch, Y_raw)
+        # 평가 (calc 는 배치를 받아도 내부적으로 순차 의미 유지 — 병렬 불가 가정).
+        # 반환은 구조화 raw 관측(마스크+스칼라) — 수치화는 tell 내부의
+        # convert_y_raw(optimizer 소유 이음새)가 담당한다. runner 는 형태를 모른다.
+        raw = calc.evaluate(batch)
+        state = opt.tell(state, batch, raw)
 
         if checkpoint_dir is not None:  # 선택적 체크포인트 (관측 + 상태 분리)
-            append_history(checkpoint_dir / "history.jsonl", batch, Y_raw,
-                           eval_index=n)
+            # 히스토리에는 변환된 (b, K) 측정치를 기록한다 (마스크 원형은
+            # 용량·가독성 문제로 보존하지 않음 — 변환은 결정적이다)
+            append_history(checkpoint_dir / "history.jsonl", batch,
+                           state["Y_raw_hist"][n:n + len(batch)], eval_index=n)
             save_state(checkpoint_dir / "state.pkl", state)
         n += len(batch)
 

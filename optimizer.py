@@ -145,38 +145,55 @@ def read_x(path: str | Path, space: SearchSpace | None = None) -> tuple[np.ndarr
     return X, eval_index
 
 
-def write_y_raw(path: str | Path, Y: np.ndarray, eval_index: int) -> None:
-    """레퍼런스 y_raw.bin 작성기 (calculator 측 기본 레이아웃).
+def write_y_raw(path: str | Path, y_raw: dict, eval_index: int) -> None:
+    """레퍼런스 y_raw.bin 작성기 (calculator 측 구조화 레이아웃).
 
-    레이아웃: int64 eval_index, int64 b, int64 K, 이어서 float64×(b·K)
-    (전부 little-endian). 실제 시스템의 calculator 가 다른 레이아웃을 쓰면
-    이 함수가 아니라 read_y_raw/convert_y_raw 쪽을 교체한다.
+    레이아웃 (전부 little-endian):
+        int64 × 4 : eval_index, b, G(마스크 한 변), n_scalar(=2)
+        uint8 × (b·G·G) : mask1        uint8 × (b·G·G) : mask2
+        float64 × b : y13              float64 × b : y23
+    실제 시스템의 calculator 가 다른 레이아웃을 쓰면 이 함수가 아니라
+    read_y_raw/convert_y_raw 쪽을 교체한다.
     """
-    Y = np.ascontiguousarray(np.atleast_2d(Y), dtype="<f8")
+    m1 = np.ascontiguousarray(y_raw["mask1"], dtype=np.uint8)
+    m2 = np.ascontiguousarray(y_raw["mask2"], dtype=np.uint8)
+    y13 = np.ascontiguousarray(y_raw["y13"], dtype="<f8")
+    y23 = np.ascontiguousarray(y_raw["y23"], dtype="<f8")
+    b, g, _ = m1.shape
+    assert m1.shape == m2.shape == (b, g, g) and y13.shape == y23.shape == (b,)
     path = Path(path)
-    header = np.array([int(eval_index), Y.shape[0], Y.shape[1]], dtype="<i8")
+    header = np.array([int(eval_index), b, g, 2], dtype="<i8")
     tmp = path.with_name(path.name + ".tmp")
-    tmp.write_bytes(header.tobytes() + Y.tobytes())
+    tmp.write_bytes(header.tobytes() + m1.tobytes() + m2.tobytes()
+                    + y13.tobytes() + y23.tobytes())
     os.replace(tmp, path)  # 원자적 교체
 
 
-def read_y_raw(path: str | Path) -> tuple[np.ndarray, int]:
-    """y_raw.bin 디코딩 → (원형 배열, eval_index). 레이아웃 위반은 즉시 raise.
+def read_y_raw(path: str | Path) -> tuple[dict, int]:
+    """y_raw.bin 디코딩 → (구조화 y_raw dict, eval_index). 위반 즉시 raise.
 
     ⚠️ 교체 지점 ①: 실제 문제의 bin 내부 구조가 다르면 이 함수를 그 레이아웃에
-    맞게 갈아끼운다. 반환 계약만 지키면 하류는 불변이다.
+    맞게 갈아끼운다. 반환 계약(convert_y_raw 가 받는 형태)만 지키면 하류 불변.
     """
     buf = Path(path).read_bytes()
-    if len(buf) < 24:
-        raise ValueError(f"{path}: 헤더(24바이트)보다 짧음 — {len(buf)}바이트")
-    eval_index, b, k = (int(v) for v in np.frombuffer(buf[:24], dtype="<i8"))
-    if b < 1 or k < 1:
-        raise ValueError(f"{path}: 헤더 손상 — b={b}, K={k}")
-    expected = 24 + 8 * b * k
+    if len(buf) < 32:
+        raise ValueError(f"{path}: 헤더(32바이트)보다 짧음 — {len(buf)}바이트")
+    eval_index, b, g, n_scalar = (int(v) for v in np.frombuffer(buf[:32], dtype="<i8"))
+    if b < 1 or g < 1 or n_scalar != 2:
+        raise ValueError(f"{path}: 헤더 손상 — b={b}, G={g}, n_scalar={n_scalar}")
+    mask_n = b * g * g
+    expected = 32 + 2 * mask_n + 8 * 2 * b
     if len(buf) != expected:
-        raise ValueError(f"{path}: 크기 불일치 — {len(buf)} ≠ {expected} (b={b}, K={k})")
-    Y = np.frombuffer(buf[24:], dtype="<f8").reshape(b, k)
-    return Y, eval_index
+        raise ValueError(f"{path}: 크기 불일치 — {len(buf)} ≠ {expected} (b={b}, G={g})")
+    off = 32
+    m1 = np.frombuffer(buf[off:off + mask_n], dtype=np.uint8).reshape(b, g, g)
+    off += mask_n
+    m2 = np.frombuffer(buf[off:off + mask_n], dtype=np.uint8).reshape(b, g, g)
+    off += mask_n
+    y13 = np.frombuffer(buf[off:off + 8 * b], dtype="<f8")
+    y23 = np.frombuffer(buf[off + 8 * b:], dtype="<f8")
+    return {"mask1": m1.astype(bool), "mask2": m2.astype(bool),
+            "y13": y13, "y23": y23}, eval_index
 
 
 # ─── 체크포인트: history.jsonl (관측의 진실) + state.pkl (내부 상태) ──────────
@@ -297,15 +314,49 @@ def load_state(state_path: str | Path, history_path: str | Path,
     return state
 
 
-def convert_y_raw(Y_file: np.ndarray, n_obj: int | None = None) -> np.ndarray:
-    """y_raw(파일 원형) → 표준 (b, K) float64 — **y_raw→y 변환 이음새**.
+def _mask_extents(mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """boolean 마스크 (b, G, G) → (max height, max width) 픽셀 측정.
 
-    ⚠️ 교체 지점 ②: 실제 문제에서 목적 배치/단위/인코딩이 다르면 이 함수만
-    수정한다 (예: 컬럼 재배열, 파생 목적 계산). 기본 구현은 항등 + 검증.
-    출력 계약: (b, K) float64, 전 원소 유한(finite). NaN/inf 는 즉시 raise —
-    조용한 대체 금지.
+    max height = 컬럼별 True 개수의 최대(가장 긴 세로 현),
+    max width  = 행별 True 개수의 최대(가장 긴 가로 현).
+    개수 기반이라 경계 flip 노이즈에 ±수 픽셀 수준으로만 흔들린다.
     """
-    Y = np.atleast_2d(np.asarray(Y_file, dtype=np.float64))
+    height = mask.sum(axis=1).max(axis=1)  # (b, G) 컬럼 카운트 → 최대
+    width = mask.sum(axis=2).max(axis=1)   # (b, G) 행 카운트 → 최대
+    return height.astype(np.float64), width.astype(np.float64)
+
+
+def convert_y_raw(Y_raw, n_obj: int | None = None) -> np.ndarray:
+    """y_raw(관측 원형) → 표준 (b, K) float64 — **y_raw→y 변환 이음새**.
+
+    ⚠️ 교체 지점 ②: 실제 문제에서 관측 형태가 다르면 이 함수만 수정한다.
+    현재 관측 형태 = 구조화 dict:
+        mask1 (b,G,G) bool → y11 = max height, y12 = max width
+        mask2 (b,G,G) bool → y21 = max height, y22 = max width
+        y13, y23 (b,)      → 그대로 통과
+    출력 계약: (b, K) float64, 열 순서 = OBJECTIVE_NAMES, 전 원소 유한.
+    NaN/inf 는 즉시 raise — 조용한 대체 금지.
+    (하위호환: 이미 (b, K) 수치 배열이면 검증만 하고 통과 — 합성 테스트용)
+    """
+    if isinstance(Y_raw, dict):
+        for key in ("mask1", "mask2", "y13", "y23"):
+            if key not in Y_raw:
+                raise ValueError(f"y_raw dict 에 {key!r} 없음 — keys={list(Y_raw)}")
+        m1 = np.asarray(Y_raw["mask1"], dtype=bool)
+        m2 = np.asarray(Y_raw["mask2"], dtype=bool)
+        if m1.ndim != 3 or m1.shape != m2.shape:
+            raise ValueError(f"마스크 형상 불일치 — {m1.shape} vs {m2.shape}")
+        h1, w1 = _mask_extents(m1)
+        h2, w2 = _mask_extents(m2)
+        y13 = np.asarray(Y_raw["y13"], dtype=np.float64).reshape(-1)
+        y23 = np.asarray(Y_raw["y23"], dtype=np.float64).reshape(-1)
+        if not (len(h1) == len(y13) == len(y23)):
+            raise ValueError(
+                f"batch 크기 불일치 — mask {len(h1)}, y13 {len(y13)}, y23 {len(y23)}")
+        Y = np.column_stack([h1, w1, y13, h2, w2, y23])  # OBJECTIVE_NAMES 순서
+    else:
+        Y = np.atleast_2d(np.asarray(Y_raw, dtype=np.float64))
+
     if Y.ndim != 2:
         raise ValueError(f"y_raw 는 2차원이어야 함: {Y.shape}")
     if n_obj is not None and Y.shape[1] != n_obj:
@@ -466,7 +517,8 @@ class OptimizerBase:
         히스토리 누적 → 스케일러 재적합 → 전 관측 재점수 → `_update` 호출.
         """
         X_new = np.atleast_2d(np.asarray(X_new, dtype=np.int64))
-        Y_new = np.atleast_2d(np.asarray(Y_raw_new, dtype=np.float64))
+        # y_raw 원형(구조화 dict 또는 수치 배열) → 표준 (b, K) — 변환 이음새 경유
+        Y_new = convert_y_raw(Y_raw_new, n_obj=len(OBJECTIVE_SENSES))
         assert len(X_new) == len(Y_new) and len(X_new) >= 1
         b = len(X_new)
         n0 = state["n_evals"]
@@ -1819,14 +1871,29 @@ if __name__ == "__main__":
                 raise AssertionError(f"raise 됐어야 함: {content!r}")
     print(f"[OK] {'x.txt 셸':>16s} — 왕복 무손실 ({X.shape}), fail-loud 4종 통과")
 
-    # y_raw.bin 셸 점검: 왕복 + convert 이음새 + fail-loud
+    # y_raw.bin 셸 점검: 구조화 왕복 + convert 측정 이음새 + fail-loud
     with tempfile.TemporaryDirectory() as d:
         p = Path(d) / "y_raw.bin"
-        Y = rng.normal(0, 1, (10, n_obj)) * np.array([9e3, 1.1, 5e-3, 9e3, 1.1, 5e-3])
-        write_y_raw(p, Y, eval_index=123)
-        Yf, idx = read_y_raw(p)
-        Y2 = convert_y_raw(Yf, n_obj=n_obj)
-        assert np.array_equal(Y, Y2) and idx == 123  # float64 비트 단위 왕복
+        g = 32
+        raw = {
+            "mask1": rng.random((10, g, g)) < 0.3,
+            "mask2": rng.random((10, g, g)) < 0.5,
+            "y13": rng.normal(0, 1, 10) * 5e-3,
+            "y23": rng.normal(0, 1, 10) * 5e-3,
+        }
+        write_y_raw(p, raw, eval_index=123)
+        raw2, idx = read_y_raw(p)
+        assert idx == 123
+        for k in raw:
+            assert np.array_equal(raw[k], raw2[k]), f"{k} 왕복 불일치"
+        Y = convert_y_raw(raw2, n_obj=n_obj)
+        assert Y.shape == (10, n_obj)
+        # 측정 정의 확인: 알려진 직사각형 마스크 → height/width 정확
+        rect = np.zeros((1, g, g), dtype=bool)
+        rect[0, 5:15, 3:7] = True  # height 10, width 4
+        Yr = convert_y_raw({"mask1": rect, "mask2": rect,
+                            "y13": [0.0], "y23": [0.0]}, n_obj=n_obj)
+        assert Yr[0, 0] == 10 and Yr[0, 1] == 4 and Yr[0, 3] == 10 and Yr[0, 4] == 4
         p.write_bytes(p.read_bytes()[:-8])  # 잘린 파일 → raise
         try:
             read_y_raw(p)
@@ -1835,12 +1902,13 @@ if __name__ == "__main__":
         else:
             raise AssertionError("잘린 y_raw.bin 은 raise 됐어야 함")
         try:
-            convert_y_raw(np.array([[1.0, np.nan]]))  # NaN → raise
+            convert_y_raw({"mask1": raw["mask1"], "mask2": raw["mask2"],
+                           "y13": [np.nan] * 10, "y23": raw["y23"]})  # NaN → raise
         except ValueError:
             pass
         else:
             raise AssertionError("NaN 은 raise 됐어야 함")
-    print(f"[OK] {'y_raw.bin 셸':>16s} — 왕복 비트 동일, convert 이음새, fail-loud 통과")
+    print(f"[OK] {'y_raw.bin 셸':>16s} — 구조화 왕복 동일, 측정 이음새, fail-loud 통과")
 
     # 체크포인트 점검: history.jsonl + state.pkl 로 중단·재개 = 무중단과 동일 궤적
     with tempfile.TemporaryDirectory() as d:
