@@ -46,6 +46,34 @@ assert set(OPTIMIZERS) == EXPECTED   # 하나라도 빠지면 불합격
   random 이 압도적 최하 (README: "random 을 못 이기면 문제가 있는 것").
 - 격자 결과 파일(matrix.json)의 이름 목록이 검수 대상이다.
 
+## 3.5 파일 구조 게이트 — "한 파일에 전부" 금지
+
+합의된 파일 구조는 요구사항이지 제안이 아니다. 각 파일이 **존재**하고,
+각 책임이 **그 파일 안에** 있어야 한다:
+
+| 파일 | 책임 | 있으면 안 되는 것 |
+|---|---|---|
+| `space.py` | 탐색 공간 표준 명세 | 문제/점수/알고리즘 |
+| `calculator.py` | X → y_raw (문제 정의·노이즈) | 점수·스케일링 개념 일체 |
+| `optimizer.py` | 알고리즘 + score 파이프라인 + 셸 | 실행 루프, 플로팅 |
+| `runner.py` | ask→평가→tell 반복 기계 | 점수 계산, 비교, 시각화 |
+| `benchmark.py` | 여러 run 비교·랭킹·시각화 | 알고리즘 구현 |
+
+기계 검수:
+1. 5개 파일 전부 존재 + 각 파일의 진입점(`python <file>` 자가 점검/CLI)이
+   단독으로 동작
+2. 공개 API 가 명세된 파일에 존재:
+   `from space import SearchSpace` / `from calculator import BENCHMARKS` /
+   `from optimizer import OPTIMIZERS, RobustScaler, SCORERS` /
+   `from runner import run_single` / `python benchmark.py --matrix ...`
+3. 책임 경계 grep: runner 에 스케일링·scalarization 없음, calculator 에
+   점수 개념 없음, optimizer 에 matplotlib 없음, benchmark 에 알고리즘 없음
+4. 벤치마크 결과는 **benchmark.py 진입점에서 생성된 것만 인정**
+   (실행 커맨드와 산출 경로가 검수 대상)
+
+한 파일에 욱여넣은 것도, 파일만 만들어 두고 빈 껍데기인 것도(로직이 다른
+파일에 있으면 3번 grep 에 걸린다) 불합격이다.
+
 ## 4. 보고 양식
 
 "통과했다" / "완료했다" 문장은 보고로 인정하지 않는다. 보고는 분수로:
@@ -75,6 +103,8 @@ random 순위 k / 11
 
 1. tmp_opt 를 import 해서 벤치마크를 돌리고 "통과"라고 보고 → 폐기됨 (§1)
 2. optimizer 1개만 구현하고 "벤치마크 통과"라고 보고 → 폐기됨 (§3, §4)
+3. runner/calculator/benchmark 를 만들지 않고 optimizer 한 파일에 전부
+   욱여넣은 뒤 "벤치마크 통과"라고 보고 → 폐기됨 (§3.5)
 
-두 경우 모두 거짓 보고가 아니라 판정문의 빈틈을 통과한 것이었다.
+세 경우 모두 거짓 보고가 아니라 판정문의 빈틈을 통과한 것이었다.
 그래서 판정문을 위처럼 고쳤다. 빈틈을 찾는 노력을 구현에 쓰라.
