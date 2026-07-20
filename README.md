@@ -9,7 +9,7 @@ method 들을 비교하는 벤치마크 프레임워크.
 |---|---|
 | `space.py` | **탐색 공간 표준 명세** — signed 정수 범위 SearchSpace. 임의의 문제 기하(x_min/x_max/blocks)가 여기를 통과해 표준화되고, 나머지 전부가 이 인터페이스만 소비한다 |
 | `calculator.py` | 문제 정의 — **X → raw y0 계산기** (벤치마크 5종 + 노이즈) |
-| `optimizer.py` | **나머지 전부** — stateless optimizer 11종 + 히스토리 누적 + 온라인 스케일링/sense 통일/scalarization (공유 score 파이프라인) |
+| `optimizer.py` | **나머지 전부** — stateless optimizer 11종 + 히스토리 누적 + 온라인 스케일링/sense 통일/scalarization (공유 score 파이프라인) + 파일 교환 셸(x.txt/y_raw.bin) + 체크포인트(history.jsonl/state.pkl) |
 | `runner.py` | calculator ↔ optimizer 를 **반복 호출하는 기계** (ask → 순차 평가 → tell) |
 | `benchmark.py` | 여러 run 비교 — pooled 재점수, 토너먼트/격자, top-3, true optimum, 시각화 |
 | `doc/algo/` | 알고리즘 소개 문서 (예: Chow-Liu 트리 EDA) |
@@ -87,6 +87,43 @@ while budget_left:
    남은 예산을 다른 basin 탐색에 쓴다 (random-restart hill climbing).
 4. **캐시**: 같은 X 재평가는 캐시로 회피해 예산을 아낀다. 탐색은 노이즈
    관측 점수로 하고, 참 점수의 anytime 평가는 calculator 가 그대로 담당한다.
+
+## 파일 교환 & 체크포인트
+
+프로세스 분리 실행을 위한 파일 형식 — 전부 optimizer.py 의 **셸 계층** 소유이며,
+ask/tell 은 파일의 존재를 모르는 순수 함수로 유지된다. 공통 규율:
+**원자적 쓰기**(tmp + `os.replace`), **fail-loud**(형식/범위/정합성 위반 즉시 raise,
+조용한 대체·건너뛰기 금지).
+
+| 파일 | 형식 | 방향/성격 | 함수 |
+|---|---|---|---|
+| `x.txt` | 텍스트 | optimizer → calculator. 다음 후보 배치 | `write_x` / `read_x` |
+| `y_raw.bin` | 바이너리 | calculator → optimizer. raw 관측 | `write_y_raw` / `read_y_raw` |
+| `history.jsonl` | jsonl | 체크포인트 — **관측의 진실**, append-only | `append_history` / `load_history` |
+| `state.pkl` | pickle | 체크포인트 — 알고리즘 상태 + RNG + 스케일러 + 점수 캐시 | `save_state` / `load_state` |
+
+**x.txt** — 1행 헤더 `# eval_index=<int>` (배치 첫 평가의 전역 카운터 — 노이즈
+시딩·대응 검증용), 2행부터 한 줄 = 해 하나 `[15,0,-1,...]` (signed 정수,
+텍스트 왕복 무손실).
+
+**y_raw.bin** — 내부 구조를 우리가 통제하지 못하는 **불투명 바이너리**로 취급.
+실제 문제의 레이아웃이 다르면 교체 지점 두 개만 갈아끼운다 (하류 불변):
+`read_y_raw`(① bin 디코딩) → `convert_y_raw`(② y_raw → 표준 (b, K) float64,
+NaN/inf 즉시 raise). 레퍼런스 레이아웃: int64 `eval_index, b, K` + float64×(b·K), LE.
+
+**history.jsonl** — 한 줄 = tell 한 번:
+`{"eval_index":0,"X":[[...]],"y_raw":[[...]]}`. X 는 정수, y_raw 는 json 의
+shortest-round-trip repr 라 float64 무손실. 사람이 읽고 diff 할 수 있으며
+pkl 없이도 post-hoc 분석(anytime 곡선·pooled 재점수)이 가능하다.
+로드 시 **eval_index 연속성**을 검증해 빠지거나 중복된 batch 를 즉시 잡는다.
+
+**state.pkl** — 히스토리를 제외한 나머지 (알고리즘 상태, RNG, 스케일러 파라미터,
+점수 캐시 — 점수는 스케일러 *이력* 에 의존하는 파생 상태라 관측이 아닌 상태로
+분류). `load_state(state.pkl, history.jsonl)` 이 두 파일을 합쳐 완전한 state 를
+재구성하며, **pkl 의 n_evals ≠ jsonl 누적 평가 수면 즉시 raise** (정합성).
+재개 계약: 중단 후 재개 = 무중단 실행과 **동일 궤적** (`python optimizer.py`
+자가 점검이 sa/ga 로 검증). jsonl 이 진실이므로 pkl 이 깨져도 히스토리를
+tell 로 재생(replay)해 상태를 재구성할 수 있다.
 
 ## BM3 (BenchmarkHard) 제작 상세
 
@@ -190,6 +227,8 @@ pip install numpy scipy scikit-learn polars xgboost matplotlib
 
 # 단일 run (runner.py)
 python runner.py --optimizer sa --benchmark bm1_easy --seed 0 --budget 800
+python runner.py --optimizer ga --benchmark bm3_hard --checkpoint-dir ckpt/
+#   → ckpt/history.jsonl + ckpt/state.pkl (optimizer.load_state 로 재개 가능)
 
 # 여러 run 비교 (benchmark.py)
 python benchmark.py                       # 토너먼트 + top-3 + 시각화 (800 evals)
