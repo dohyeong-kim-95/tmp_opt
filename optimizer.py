@@ -39,6 +39,9 @@
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
+
 import numpy as np
 
 from calculator import OBJECTIVE_SENSES
@@ -58,6 +61,77 @@ def _rng_load(state: dict) -> np.random.Generator:
 def _rng_save(state: dict, rng: np.random.Generator) -> None:
     """RNG 의 현재 상태를 state dict 에 기록한다 (pickle 가능한 순수 dict)."""
     state["rng"] = rng.bit_generator.state
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 파일 교환 셸 (x.txt) — optimizer 가 소유하는 프로세스 간 교환 형식.
+# 주의: 이 계층은 진입부(셸) 전용이다. OptimizerBase 와 알고리즘 클래스의
+# ask/tell 은 파일의 존재를 모르는 순수 함수로 유지한다.
+#
+# 형식:
+#     # eval_index=123
+#     [15,0,0,0,-1,-3,5,3]
+#     [-15,0,3,0,-1,3,2,9]
+# - 1행 헤더 = 이 배치 첫 평가의 전역 카운터 (노이즈 시딩·대응 검증용)
+# - 2행부터 한 줄 = 해 하나 (signed 정수, 텍스트 왕복 무손실)
+# 규율: 원자적 쓰기(tmp + os.replace), fail-loud(형식/범위 위반 즉시 raise).
+# ──────────────────────────────────────────────────────────────────────────────
+
+def write_x(path: str | Path, X: np.ndarray, eval_index: int) -> None:
+    """후보 배치 X 를 x.txt 형식으로 원자적으로 쓴다.
+
+    Args:
+        X          : (b, n_cols) 정수 배열 (signed 값)
+        eval_index : 이 배치의 첫 평가가 갖는 전역 평가 카운터 (0-base)
+    """
+    X = np.asarray(X)
+    assert X.ndim == 2 and len(X) >= 1, f"X 는 (b, n_cols) 2차원이어야 함: {X.shape}"
+    assert np.issubdtype(X.dtype, np.integer), f"X 는 정수여야 함: {X.dtype}"
+    path = Path(path)
+
+    lines = [f"# eval_index={int(eval_index)}"]
+    lines += ["[" + ",".join(str(int(v)) for v in row) + "]" for row in X]
+
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text("\n".join(lines) + "\n")
+    os.replace(tmp, path)  # 원자적 교체 — 독자는 완전한 파일만 본다
+
+
+def read_x(path: str | Path, space: SearchSpace | None = None) -> tuple[np.ndarray, int]:
+    """x.txt 를 읽어 (X, eval_index) 를 돌려준다. 형식 위반은 즉시 raise.
+
+    Args:
+        space: 주어지면 각 값이 [x_min, x_max] 안인지까지 검증한다.
+    """
+    text = Path(path).read_text()
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if not lines or not lines[0].startswith("# eval_index="):
+        raise ValueError(f"{path}: 1행은 '# eval_index=<int>' 헤더여야 함")
+    eval_index = int(lines[0].removeprefix("# eval_index="))
+
+    rows = []
+    for i, ln in enumerate(lines[1:], start=2):
+        if not (ln.startswith("[") and ln.endswith("]")):
+            raise ValueError(f"{path}:{i}: 행은 [v,v,...] 형식이어야 함: {ln!r}")
+        rows.append([int(tok) for tok in ln[1:-1].split(",")])  # 정수 아님 → 즉시 raise
+    if not rows:
+        raise ValueError(f"{path}: 해가 한 줄도 없음")
+    widths = {len(r) for r in rows}
+    if len(widths) != 1:
+        raise ValueError(f"{path}: 행 길이 불일치: {sorted(widths)}")
+
+    X = np.asarray(rows, dtype=np.int64)
+    if space is not None:
+        if X.shape[1] != space.n_cols:
+            raise ValueError(f"{path}: n_cols {X.shape[1]} ≠ 명세 {space.n_cols}")
+        bad = (X < space.x_min) | (X > space.x_max)
+        if bad.any():
+            r, c = map(int, np.argwhere(bad)[0])
+            raise ValueError(
+                f"{path}: 값 범위 위반 — 행 {r} 컬럼 {c}: {X[r, c]} ∉ "
+                f"[{space.x_min[c]}, {space.x_max[c]}]"
+            )
+    return X, eval_index
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1537,3 +1611,28 @@ if __name__ == "__main__":
         batch, _ = opt.ask(state2)
         print(f"[OK] {name:>16s} — {n} evals, "
               f"state pickle {len(blob)} bytes, resume ask batch={len(batch)}")
+
+    # 파일 교환 셸 점검: x.txt 왕복 무손실 + fail-loud
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "x.txt"
+        X = space.sample(rng, n=10)
+        write_x(p, X, eval_index=123)
+        X2, idx = read_x(p, space=space)
+        assert np.array_equal(X, X2) and idx == 123
+        assert (X2.min(axis=0) < 0).any(), "signed 값이 실제로 왕복되어야 함"
+        for content in [
+            "[1,2,3]\n",                                # 헤더 없음
+            "# eval_index=0\n[1,2.5,3]\n",              # 정수 아님
+            "# eval_index=0\n[1,2]\n[1,2,3]\n",         # 길이 불일치
+            "# eval_index=0\n[" + ",".join(["999"] * space.n_cols) + "]\n",  # 범위 밖
+        ]:
+            p.write_text(content)
+            try:
+                read_x(p, space=space)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"raise 됐어야 함: {content!r}")
+    print(f"[OK] {'x.txt 셸':>16s} — 왕복 무손실 ({X.shape}), fail-loud 4종 통과")
