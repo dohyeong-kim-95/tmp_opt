@@ -39,7 +39,9 @@
 
 from __future__ import annotations
 
+import json
 import os
+import pickle
 from pathlib import Path
 
 import numpy as np
@@ -175,6 +177,124 @@ def read_y_raw(path: str | Path) -> tuple[np.ndarray, int]:
         raise ValueError(f"{path}: 크기 불일치 — {len(buf)} ≠ {expected} (b={b}, K={k})")
     Y = np.frombuffer(buf[24:], dtype="<f8").reshape(b, k)
     return Y, eval_index
+
+
+# ─── 체크포인트: history.jsonl (관측의 진실) + state.pkl (내부 상태) ──────────
+#
+# history.jsonl — append-only, 한 줄 = tell 한 번:
+#     {"eval_index":0,"X":[[15,0,...]],"y_raw":[[5686.2,...]]}
+#   X 는 정수, y_raw 는 Python json 의 shortest-round-trip repr 로 float64
+#   무손실. 사람이 읽고 diff 할 수 있으며, pkl 없이도 post-hoc 분석이 가능하다.
+# state.pkl — 히스토리를 제외한 나머지: 알고리즘 상태 + RNG + 스케일러
+#   파라미터 + 점수 캐시(_s_buf). 점수는 스케일러 *이력* 에 의존하는 파생
+#   상태라(rescore_interval>1 이면 재계산 불가) 관측이 아니라 상태로 취급한다.
+# 정합성: load_state 가 pkl 의 n_evals 와 jsonl 의 누적 평가 수를 대조해
+#   어긋나면 즉시 raise. jsonl 이 진실이므로, pkl 이 깨지면 히스토리를
+#   처음부터 tell 로 재생(replay)해 상태를 재구성할 수도 있다.
+# ──────────────────────────────────────────────────────────────────────────────
+
+#: state.pkl 에서 제외되는 키 — 히스토리 버퍼(jsonl 이 원천)와 파생 뷰
+_HISTORY_STATE_KEYS = ("_X_buf", "_Y_buf", "_s_buf",
+                       "X_hist", "Y_raw_hist", "scores_hist")
+
+
+def append_history(path: str | Path, X_new: np.ndarray, Y_new: np.ndarray,
+                   eval_index: int) -> None:
+    """tell 한 번 분량의 (X, y_raw) 관측을 history.jsonl 에 한 줄 append 한다.
+
+    eval_index 는 이 batch 첫 평가의 전역 카운터 — load 시 연속성 검증에 쓴다.
+    """
+    X_new = np.atleast_2d(np.asarray(X_new))
+    Y_new = np.atleast_2d(np.asarray(Y_new))
+    assert len(X_new) == len(Y_new) >= 1
+    line = json.dumps(
+        {"eval_index": int(eval_index),
+         "X": X_new.astype(np.int64).tolist(),
+         "y_raw": Y_new.astype(np.float64).tolist()},
+        separators=(",", ":"),
+    )
+    with open(path, "a") as f:
+        f.write(line + "\n")
+
+
+def load_history(path: str | Path,
+                 space: SearchSpace | None = None) -> tuple[np.ndarray, np.ndarray]:
+    """history.jsonl 전체를 읽어 (X (n, n_cols), Y_raw (n, K)) 로 잇는다.
+
+    fail-loud: JSON 손상, eval_index 불연속(빠졌거나 중복된 batch), 행 폭
+    불일치, (space 를 주면) 값 범위 위반 — 전부 즉시 raise. 크래시로 마지막
+    줄이 잘렸다면 그 줄을 수동으로 지운 뒤 다시 로드한다(자동 절단은 안 한다).
+    """
+    Xs, Ys = [], []
+    n = 0
+    with open(path) as f:
+        for lineno, ln in enumerate(f, start=1):
+            if not ln.strip():
+                continue
+            try:
+                rec = json.loads(ln)
+            except json.JSONDecodeError as e:
+                raise ValueError(f"{path}:{lineno}: JSON 손상 — {e}") from e
+            if rec["eval_index"] != n:
+                raise ValueError(
+                    f"{path}:{lineno}: eval_index 불연속 — {rec['eval_index']} ≠ 누적 {n}")
+            X = np.asarray(rec["X"], dtype=np.int64)
+            Y = np.asarray(rec["y_raw"], dtype=np.float64)
+            if X.ndim != 2 or Y.ndim != 2 or len(X) != len(Y):
+                raise ValueError(f"{path}:{lineno}: X/y_raw 형상 불일치 — {X.shape}/{Y.shape}")
+            Xs.append(X)
+            Ys.append(Y)
+            n += len(X)
+    if not Xs:
+        raise ValueError(f"{path}: 관측이 한 줄도 없음")
+    X_all = np.vstack(Xs)
+    Y_all = np.vstack(Ys)
+    if space is not None:
+        if X_all.shape[1] != space.n_cols:
+            raise ValueError(f"{path}: n_cols {X_all.shape[1]} ≠ 명세 {space.n_cols}")
+        if ((X_all < space.x_min) | (X_all > space.x_max)).any():
+            raise ValueError(f"{path}: 값 범위 위반 행 존재")
+    return X_all, Y_all
+
+
+def save_state(path: str | Path, state: dict) -> None:
+    """히스토리를 제외한 optimizer 상태를 state.pkl 로 원자적으로 저장한다.
+
+    점수 캐시(_s_buf)는 채워진 구간만 잘라 포함한다(파생 상태 — §체크포인트 노트).
+    """
+    path = Path(path)
+    slim = {k: v for k, v in state.items() if k not in _HISTORY_STATE_KEYS}
+    slim["_scores"] = np.array(state["_s_buf"][: state["n_evals"]])
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "wb") as f:
+        pickle.dump(slim, f)
+    os.replace(tmp, path)  # 원자적 교체
+
+
+def load_state(state_path: str | Path, history_path: str | Path,
+               space: SearchSpace | None = None) -> dict:
+    """state.pkl + history.jsonl 에서 완전한 state dict 를 재구성한다.
+
+    정합성 fail-loud: pkl 의 n_evals ≠ jsonl 누적 평가 수 → 즉시 raise.
+    반환된 state 는 무중단 실행의 그 시점 state 와 동일 거동(동일 궤적 재개).
+    """
+    with open(state_path, "rb") as f:
+        slim = pickle.load(f)
+    X, Y = load_history(history_path, space=space)
+    n = slim["n_evals"]
+    if len(X) != n:
+        raise ValueError(
+            f"체크포인트 정합성 위반 — state.pkl n_evals={n} ≠ history.jsonl {len(X)}")
+    scores = slim.pop("_scores")
+    if len(scores) != n:
+        raise ValueError(f"점수 캐시 길이 {len(scores)} ≠ n_evals {n}")
+
+    state = dict(slim)
+    state["_X_buf"] = np.ascontiguousarray(X, dtype=np.int64)
+    state["_Y_buf"] = np.ascontiguousarray(Y, dtype=np.float64)
+    state["_s_buf"] = np.ascontiguousarray(scores, dtype=np.float64)
+    OptimizerBase._sync_views(state)
+    return state
 
 
 def convert_y_raw(Y_file: np.ndarray, n_obj: int | None = None) -> np.ndarray:
@@ -1721,3 +1841,46 @@ if __name__ == "__main__":
         else:
             raise AssertionError("NaN 은 raise 됐어야 함")
     print(f"[OK] {'y_raw.bin 셸':>16s} — 왕복 비트 동일, convert 이음새, fail-loud 통과")
+
+    # 체크포인트 점검: history.jsonl + state.pkl 로 중단·재개 = 무중단과 동일 궤적
+    with tempfile.TemporaryDirectory() as d:
+        hist = Path(d) / "history.jsonl"
+        st = Path(d) / "state.pkl"
+        W = np.random.default_rng(1).normal(size=(space.n_cols, n_obj))
+
+        def f(X):  # 결정적 합성 관측 (재개 검증엔 노이즈 불필요)
+            return X.astype(np.float64) @ W
+
+        for name in ["sa", "ga"]:  # batch=1 과 batch=20 대표
+            opt = OPTIMIZERS[name](space, total_budget=200)
+            s = opt.init_state(seed=3)  # ── 무중단 12 tells (기준 궤적)
+            for _ in range(12):
+                b, s = opt.ask(s)
+                s = opt.tell(s, b, f(b))
+            ref_X, ref_s = s["X_hist"].copy(), s["scores_hist"].copy()
+
+            hist.unlink(missing_ok=True)  # ── 6 tells → 체크포인트 → 재개 6 tells
+            s2 = opt.init_state(seed=3)
+            for _ in range(6):
+                b, s2 = opt.ask(s2)
+                n0 = s2["n_evals"]
+                s2 = opt.tell(s2, b, f(b))
+                append_history(hist, b, f(b), eval_index=n0)
+            save_state(st, s2)
+            s3 = load_state(st, hist, space=space)
+            for _ in range(6):
+                b, s3 = opt.ask(s3)
+                s3 = opt.tell(s3, b, f(b))
+            assert np.array_equal(s3["X_hist"], ref_X), f"{name}: 재개 궤적 불일치"
+            assert np.allclose(s3["scores_hist"], ref_s), f"{name}: 재개 점수 불일치"
+
+        # 정합성 fail-loud: 히스토리에 여분 batch → n_evals 불일치 → raise
+        append_history(hist, space.sample(rng, 1), np.zeros((1, n_obj)),
+                       eval_index=s2["n_evals"])
+        try:
+            load_state(st, hist, space=space)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("n_evals 불일치는 raise 됐어야 함")
+    print(f"[OK] {'체크포인트':>16s} — sa/ga 중단·재개 동일 궤적, 정합성 fail-loud 통과")

@@ -18,7 +18,6 @@
 from __future__ import annotations
 
 import argparse
-import pickle
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -26,7 +25,7 @@ from pathlib import Path
 import numpy as np
 
 from calculator import BENCHMARKS
-from optimizer import OPTIMIZERS, OptimizerBase, SCORERS
+from optimizer import OPTIMIZERS, OptimizerBase, SCORERS, append_history, save_state
 from space import SearchSpace
 
 
@@ -49,14 +48,15 @@ def run_single(
     seed: int,
     budget: int,
     scorer_name: str = "chebyshev",
-    state_file: Path | None = None,
+    checkpoint_dir: Path | None = None,
 ) -> RunResult:
     """optimizer 하나를 벤치마크 하나에서 budget 회 평가할 때까지 실행한다.
 
     Args:
-        scorer_name: optimizer 내부 score 파이프라인의 scalarization 선택.
-        state_file : 지정하면 매 tell 후 상태를 pickle 로 저장한다 (체크포인트.
-                     히스토리도 상태 안에 있으므로 이 파일 하나로 재개 가능).
+        scorer_name   : optimizer 내부 score 파이프라인의 scalarization 선택.
+        checkpoint_dir: 지정하면 매 tell 후 history.jsonl(관측 append-only) +
+                        state.pkl(알고리즘 상태)을 기록한다. 이 두 파일로
+                        optimizer.load_state 재개가 가능하다.
     """
     space = SearchSpace()
     calc = BENCHMARKS[benchmark_name](noise_seed=seed)
@@ -66,6 +66,10 @@ def run_single(
     # 배선(dispatch) 판별: 요청한 이름과 생성된 optimizer 가 일치해야 한다.
     assert opt.name == optimizer_name, \
         f"dispatch 불일치: 요청 {optimizer_name!r} → 생성 {opt.name!r}"
+
+    if checkpoint_dir is not None:  # 새 run 은 이전 히스토리를 이어 쓰지 않는다
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        (checkpoint_dir / "history.jsonl").unlink(missing_ok=True)
 
     state = opt.init_state(seed)
     t0 = time.perf_counter()
@@ -77,11 +81,12 @@ def run_single(
         # 순차 평가 (실전 가정: 병렬 불가) — 한 행씩 평가해 모은다
         Y_raw = np.array([calc.evaluate(x) for x in batch])
         state = opt.tell(state, batch, Y_raw)
-        n += len(batch)
 
-        if state_file is not None:  # 선택적 체크포인트
-            with open(state_file, "wb") as f:
-                pickle.dump(state, f)
+        if checkpoint_dir is not None:  # 선택적 체크포인트 (관측 + 상태 분리)
+            append_history(checkpoint_dir / "history.jsonl", batch, Y_raw,
+                           eval_index=n)
+            save_state(checkpoint_dir / "state.pkl", state)
+        n += len(batch)
 
     assert state["n_evals"] == budget  # 히스토리 무결성 (optimizer 소유)
     return RunResult(
@@ -106,12 +111,12 @@ def main() -> None:
                         help="run 당 평가 횟수 (기본 800)")
     parser.add_argument("--scorer", choices=list(SCORERS), default="chebyshev",
                         help="optimizer 내부 scalarization (기본 chebyshev)")
-    parser.add_argument("--state-file", type=Path, default=None,
-                        help="매 tell 후 상태를 저장할 pickle 경로 (체크포인트)")
+    parser.add_argument("--checkpoint-dir", type=Path, default=None,
+                        help="매 tell 후 history.jsonl + state.pkl 을 기록할 디렉토리")
     args = parser.parse_args()
 
     r = run_single(args.optimizer, args.benchmark, args.seed, args.budget,
-                   args.scorer, args.state_file)
+                   args.scorer, args.checkpoint_dir)
     drive_best = float(r.final_state["scores_hist"].max())
     print(f"{r.optimizer} on {r.benchmark} seed={r.seed}: "
           f"{len(r.X)} evals, {r.elapsed_sec:.1f}s, "
