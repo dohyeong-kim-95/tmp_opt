@@ -74,6 +74,10 @@ j그룹별 규격(j=1 수천, j=2 ~1 음수오프셋, j=3 ~0.0x)에 ±20% 지터
 | F5 | **ruggedness** | `Σ r·sin(15~25·u)` 고주파 저진폭 | 미세 개선 신호가 노이즈에 묻힘 | 유한차분·민감한 수락판정 |
 | F6 | **목적 충돌(trade-off)** | `+c_gain·c(u)`, c=common 가중평균 | 전 목적 동시만족 해가 없음 | 스칼라화·단일 최적 |
 
+각 factor 를 컬럼 2개에 대한 3D 서피스로 본 것: [`factors_3d.png`](factors_3d.png).
+F1 돔(분리가능) / F2 안장(비분리 시작) / F3 대각선 능선(블록결합) / F4 가짜고원+모서리
+급봉(기만) / F5 계란판 잔물결(rugged) / F6 기울어진 평면(전 목적에 같은 부호로 가산).
+
 각 부품의 1D 모양은 [`primitives.png`](primitives.png), 5벤치의 실제 지형을
 3D 서피스(y11 latent 를 컬럼 2개에 대해)로 본 것은
 [`landscapes_3d.png`](landscapes_3d.png) 참조.
