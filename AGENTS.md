@@ -42,6 +42,8 @@ assert set(OPTIMIZERS) == EXPECTED   # 하나라도 빠지면 불합격
 
 - 계약 테스트 스위트는 이 명단으로 **parametrize** 된다 — 미구현은
   skip 이 아니라 **fail** 이다.
+- 플러그인(`--plugin`)으로 추가되는 알고리즘은 이 명단에 포함되지 않는다.
+  `algo_template.py` 를 import 하지 않는 한 `OPTIMIZERS` 는 11종 그대로다.
 - "통과" 판정 = 11종 전원이 반응표면에서 예산을 완주하고, 각 run 의
   커버리지 리포트(`no_data_rate`, 관측까지의 해밍거리)가 남아 있을 것.
 
@@ -58,6 +60,7 @@ assert set(OPTIMIZERS) == EXPECTED   # 하나라도 빠지면 불합격
 | `runner.py` | ask→평가→tell 반복 기계 | 점수 계산, 비교, 시각화 |
 | `make_dataset.py` | 관측 설계 + 측정 → obs.jsonl | 알고리즘·점수 개념 |
 | `accept.py` | 완료조건 판정 (참값 대조) | production 로직 |
+| `algo_template.py` | 알고리즘 추가 템플릿 (복사용) | 필수 optimizer 구현 |
 
 기계 검수:
 1. 5개 파일 전부 존재 + 각 파일의 진입점(`python <file>` 자가 점검/CLI)이

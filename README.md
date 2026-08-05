@@ -17,6 +17,7 @@
 | `optimizer.py` | **나머지 전부** — stateless optimizer 11종 + 히스토리 누적 + 온라인 스케일링/sense 통일/scalarization (공유 score 파이프라인) + 파일 교환 셸(x.txt/y_raw.bin) + 체크포인트(history.jsonl/state.pkl) |
 | `runner.py` | calculator ↔ optimizer 를 **반복 호출하는 기계** (ask → 순차 평가 → tell) |
 | `make_dataset.py` | **관측 데이터셋 생성** — one-hot 스크리닝 / 무작위 / 반복측정 설계 → `obs.jsonl` |
+| `algo_template.py` | **새 알고리즘 템플릿** — 함수 하나로 추가. 복사해서 시작 |
 | `accept.py` | **시뮬레이션 환경 완료조건 검사** — 참값 대조로 4항목 판정 |
 | `lesson_learned.md` | 합성 벤치마크 시대에서 건진 것 (설계·알고리즘·관측모델 교훈) |
 | `doc/algo/` | 알고리즘 소개 문서 (`xgb_tr`, Chow-Liu 트리 EDA) |
@@ -274,7 +275,43 @@ python runner.py --optimizer ga --surface-data obs.jsonl --budget 780 --separate
 `python space.py` (공간 불변식), `python calculator.py --surface-selfcheck`
 (반응표면 요구 3종 + blob 보간), `python optimizer.py` (전체 optimizer 의
 ask-tell 사이클 + pickle 체크포인트), `python make_dataset.py --selfcheck`
-(설계 불변식 + 블록 구조 복원), `python accept.py` (시뮬레이션 환경 완료조건).
+(설계 불변식 + 블록 구조 복원), `python algo_template.py` (함수 스타일 알고리즘
++ 재개 궤적), `python accept.py` (시뮬레이션 환경 완료조건).
+
+## 알고리즘 추가하기
+
+새 알고리즘은 **함수 하나**면 된다. 클래스도 상속도 필요 없다:
+
+```python
+from optimizer import algorithm
+
+@algorithm("my_hill", state={"cur": None}, step=2)
+def my_hill(X, scores, state, rng, ctx):
+    if len(X) == 0:
+        return ctx.sample(rng, 1)              # 첫 호출 — 히스토리가 비었다
+    i = len(scores) - 1                         # 방금 평가된 점
+    if state["cur"] is None or scores[i] > scores[state["cur"]]:
+        state["cur"] = i
+    return [ctx.mutate(rng, X[state["cur"]], rate=ctx.cfg["step"] / ctx.space.n_cols)]
+```
+
+```bash
+python runner.py --plugin algo_template --optimizer my_hill --surface-data obs.jsonl
+python runner.py --plugin algo_template --optimizer my_hill --surface-data obs.jsonl --separate xchg/
+```
+
+계약은 하나다 — **"지금까지의 관측을 보고 다음에 평가할 X 들을 돌려준다."**
+인자는 선언한 것만 넘어온다(`X`, `Y`, `scores`, `state`, `rng`, `ctx`).
+`scores` 는 정규화·sense 통일·scalarization 이 끝난 [0,1] 값이라 직접 만들
+필요가 없다(만들면 알고리즘 간 비교가 깨진다).
+
+지킬 규칙 셋: ① 첫 호출은 히스토리가 비어 있다 ② `state` 에는 pickle 가능한
+값만(프로세스 분리 실행은 매 스텝이 새 프로세스) ③ 난수는 `rng` 만.
+
+기존 11종처럼 `OptimizerBase` 를 상속해도 되고 둘은 같은 계약이다 — 함수
+스타일은 그 위에 얹은 얇은 어댑터다. 자세히:
+[`doc/algo/adding_an_algorithm.md`](doc/algo/adding_an_algorithm.md),
+복사용 템플릿: [`algo_template.py`](algo_template.py)
 
 ## 시뮬레이션 환경 완료조건 (`accept.py`)
 

@@ -31,7 +31,7 @@ import numpy as np
 
 from calculator import SurfaceCalculator
 from optimizer import (OPTIMIZERS, OptimizerBase, SCORERS, append_history,
-                       load_history, save_state)
+                       load_history, load_plugins, save_state)
 from space import SearchSpace
 
 _HERE = Path(__file__).resolve().parent
@@ -121,6 +121,7 @@ def run_separated(
     budget: int,
     exchange_dir: Path,
     verbose: bool = True,
+    plugins: list[str] | None = None,
 ) -> RunResult:
     """**프로세스 분리** 실행 — optimizer 와 calculator 를 별도 서브프로세스로
     번갈아 띄우고 교환 디렉토리의 파일(x.txt / y_raw.bin)로만 통신한다.
@@ -141,6 +142,8 @@ def run_separated(
     opt_cmd = [sys.executable, str(_HERE / "optimizer.py"), "--serve-step",
                "--optimizer", optimizer_name, "--dir", str(d),
                "--seed", str(seed), "--budget", str(budget)]
+    for m in plugins or ():  # 외부 파일 알고리즘은 서브프로세스에서 다시 import
+        opt_cmd += ["--plugin", m]
     calc_cmd = [sys.executable, str(_HERE / "calculator.py"), "--serve-eval",
                 "--surface-data", str(surface_data), "--dir", str(d),
                 "--seed", str(seed)]
@@ -173,7 +176,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="단일 run 실행기 — 반응표면 위에서 optimizer 하나를 구동"
     )
-    parser.add_argument("--optimizer", choices=list(OPTIMIZERS), default="random")
+    # choices 미지정 — 플러그인은 파서 생성 뒤에 등록된다 (검증은 아래에서)
+    parser.add_argument("--optimizer", default="random")
+    parser.add_argument("--plugin", action="append", default=[], metavar="MODULE",
+                        help="알고리즘이 정의된 모듈 (예: algo_template). 반복 지정 가능")
     parser.add_argument("--surface-data", type=Path, required=True, metavar="JSONL",
                         help="실측 관측 obs.jsonl (make_dataset.py 산출)")
     parser.add_argument("--seed", type=int, default=0)
@@ -187,10 +193,14 @@ def main() -> None:
                         help="프로세스 분리 실행 — optimizer/calculator 를 별도 "
                              "서브프로세스로 띄우고 지정 디렉토리의 파일로만 통신")
     args = parser.parse_args()
+    load_plugins(args.plugin)
+    if args.optimizer not in OPTIMIZERS:
+        raise SystemExit(f"알 수 없는 optimizer {args.optimizer!r}. "
+                         f"사용 가능: {sorted(OPTIMIZERS)}")
 
     if args.separate is not None:  # 파일 기반 프로세스 분리 실행
         r = run_separated(args.optimizer, args.surface_data, args.seed,
-                          args.budget, args.separate)
+                          args.budget, args.separate, plugins=args.plugin)
         print(f"{r.optimizer} on {r.source} seed={r.seed}: "
               f"{len(r.X)} evals via 파일 교환 ({args.separate})")
         return

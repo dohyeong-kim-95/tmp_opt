@@ -1887,17 +1887,203 @@ OPTIMIZERS: dict[str, type[OptimizerBase]] = {
 }
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# 확장 지점 — **함수 하나로 알고리즘 추가하기**
+#
+# 위의 11종은 클래스로 쓰였지만, 클래스는 요구사항이 아니다. 새 알고리즘은
+# 함수 하나로 충분하다:
+#
+#     @algorithm("my_sa", state={"cur": None}, t_start=0.1)
+#     def my_sa(X, scores, state, rng, ctx):
+#         if len(X) == 0:
+#             return ctx.sample(rng, 1)              # 첫 호출: 히스토리가 비어 있다
+#         i = len(scores) - 1                        # 방금 평가된 점
+#         ...
+#         return [ctx.mutate(rng, X[state["cur"]])], state
+#
+# 계약은 하나다: **"지금까지의 관측을 보고 다음에 평가할 X 들을 돌려준다."**
+# 매 라운드 한 번 호출되며, 그때의 전체 히스토리를 받는다.
+#
+# 인자는 **선언한 것만** 넘어온다 (이름으로 매칭). 쓸 수 있는 이름:
+#     X       (n, 30) int64   지금까지 평가된 X (평가 순서)
+#     Y       (n, 6)  float   대응 raw 관측 (열 순서 = OBJECTIVE_NAMES)
+#     scores  (n,)    float   [0,1] 점수, 클수록 좋음. 스케일 정규화·sense 통일·
+#                             scalarization 이 이미 적용돼 있다 (RobustScaler +
+#                             SCORERS). 알고리즘이 다시 구현할 필요가 없고,
+#                             다시 구현하면 알고리즘 간 비교가 무의미해진다.
+#     state   dict            라운드 간 기억. @algorithm(state=...) 가 초기값.
+#     rng     Generator       난수. 이것만 쓰면 재현성이 보장된다.
+#     ctx     Ctx             space / budget / cfg + 헬퍼(sample, mutate, top_k)
+#
+# 반환은 `xs` 또는 `(xs, state)`. xs 는 (30,) 하나, 그 리스트, 또는 (b, 30) 배열.
+# state 는 dict 라 제자리 수정도 반영되므로 굳이 반환하지 않아도 된다.
+#
+# 지켜야 할 것 하나: **state 에는 pickle 가능한 값만 넣는다.** 프로세스 분리
+# 실행(`--serve-step`)은 매 스텝이 새 프로세스라 state.pkl 이 유일한 기억이다.
+# (그래서 제너레이터/코루틴 스타일은 쓸 수 없다 — 실행 상태는 직렬화 불가)
+#
+# 다른 파일에 정의했다면 프로세스 분리 실행에 `--plugin 모듈명` 을 붙인다.
+# 자세한 안내와 템플릿: `algo_template.py`, `doc/algo/adding_an_algorithm.md`
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class Ctx:
+    """알고리즘이 쓰는 공간·예산·설정과 헬퍼. **탐색 상태는 담지 않는다.**"""
+
+    def __init__(self, space: SearchSpace, budget: int, cfg: dict) -> None:
+        self.space = space
+        self.budget = budget
+        self.cfg = cfg
+
+    def sample(self, rng: np.random.Generator, n: int = 1) -> np.ndarray:
+        """균등 랜덤 X (n, 30)."""
+        return self.space.sample(rng, n)
+
+    def mutate(self, rng: np.random.Generator, x: np.ndarray,
+               rate: float = 1.0 / 30) -> np.ndarray:
+        """ordinal 이웃: 대체로 ±1 스텝, 가끔 랜덤 점프. 최소 1컬럼은 변한다."""
+        x = np.asarray(x, dtype=np.int64).copy()
+        m = rng.random(self.space.n_cols) < rate
+        if not m.any():
+            m[rng.integers(self.space.n_cols)] = True
+        for c in np.flatnonzero(m):
+            if rng.random() < 0.8:
+                x[c] += rng.choice([-1, 1])
+            else:
+                x[c] = rng.integers(self.space.x_min[c], self.space.x_max[c] + 1)
+        return self.space.clip(x)
+
+    @staticmethod
+    def top_k(X: np.ndarray, scores: np.ndarray, k: int) -> np.ndarray:
+        """점수 상위 k 개의 X (내림차순)."""
+        return X[np.argsort(scores)[::-1][:k]]
+
+    def clip(self, x: np.ndarray) -> np.ndarray:
+        return self.space.clip(x)
+
+
+def algorithm(name: str, state: dict | None = None, **cfg):
+    """함수 하나를 optimizer 로 등록하는 데코레이터 (`OPTIMIZERS[name]`).
+
+    Args:
+        name  : 레지스트리 키 (runner 의 --optimizer 값)
+        state : 라운드 간 기억의 초기값. 매 run 마다 깊은 복사되어 들어간다.
+        **cfg : 하이퍼파라미터 기본값 → `ctx.cfg`. 생성 시 덮어쓸 수 있다.
+    """
+    import copy
+    import inspect
+
+    if state is not None and not isinstance(state, dict):
+        raise TypeError("state 는 dict 여야 한다 (pickle 가능한 값만)")
+
+    def decorate(fn):
+        params = list(inspect.signature(fn).parameters)
+        unknown = set(params) - {"X", "Y", "scores", "state", "rng", "ctx"}
+        if unknown:
+            raise TypeError(
+                f"{name}: 알 수 없는 인자 {sorted(unknown)} — "
+                "쓸 수 있는 이름은 X, Y, scores, state, rng, ctx")
+
+        class _FunctionOptimizer(OptimizerBase):
+            __doc__ = fn.__doc__ or f"함수 스타일 optimizer {name!r}."
+
+            def __init__(self, space, total_budget: int = 800, **kw):
+                base = {k: kw.pop(k) for k in ("scorer_name", "rescore_interval")
+                        if k in kw}
+                super().__init__(space, total_budget, **base)
+                merged = dict(cfg)
+                merged.update(kw)  # 나머지 키워드는 하이퍼파라미터 덮어쓰기
+                self.ctx = Ctx(space, total_budget, merged)
+
+            def init_state(self, seed: int) -> dict:
+                st = super().init_state(seed)
+                st.update(copy.deepcopy(state) if state else {})
+                return st
+
+            def ask(self, st: dict) -> tuple[np.ndarray, dict]:
+                rng = _rng_load(st)
+                pool = {"X": st["X_hist"], "Y": st["Y_raw_hist"],
+                        "scores": st["scores_hist"], "state": st,
+                        "rng": rng, "ctx": self.ctx}
+                out = fn(**{k: pool[k] for k in params})
+                if isinstance(out, tuple) and len(out) == 2 and \
+                        isinstance(out[1], dict):
+                    xs, new_state = out
+                    if new_state is not st:
+                        st.update(new_state)
+                else:
+                    xs = out
+                batch = np.atleast_2d(np.asarray(xs, dtype=np.int64))
+                if batch.ndim != 2 or batch.shape[1] != self.space.n_cols:
+                    raise ValueError(
+                        f"{name}: 반환 형상 {batch.shape} — (b, {self.space.n_cols}) 여야 함")
+                if len(batch) == 0:
+                    raise ValueError(f"{name}: 빈 배치를 반환했다")
+                batch = self.space.clip(batch)  # 범위 밖은 조용히 어긋나지 않게 클램프
+                _rng_save(st, rng)
+                return batch, st
+
+            def _update(self, st, X_hist, scores_hist):
+                return st  # 히스토리 누적은 베이스 tell 이 이미 했다
+
+        _FunctionOptimizer.name = name
+        _FunctionOptimizer.__name__ = f"{name}_FunctionOptimizer"
+        if name in OPTIMIZERS:
+            raise ValueError(f"optimizer 이름 중복: {name!r}")
+        OPTIMIZERS[name] = _FunctionOptimizer
+        fn.optimizer_cls = _FunctionOptimizer  # 테스트에서 직접 꺼내 쓸 수 있게
+        return fn
+
+    return decorate
+
+
+def load_plugins(modules) -> list[str]:
+    """알고리즘이 정의된 모듈을 import 해 레지스트리에 올린다.
+
+    프로세스 분리 실행은 매 스텝 새 프로세스라, 외부 파일에 정의한 알고리즘은
+    그 프로세스에서 다시 import 되어야 한다 (`--plugin` 이 이 함수를 부른다).
+    """
+    import importlib
+    import sys
+
+    added = []
+    for m in modules or ():
+        before = set(OPTIMIZERS)
+        importlib.import_module(m)
+        # `python optimizer.py` 로 실행하면 이 코드는 __main__ 모듈에 있고,
+        # 플러그인의 `from optimizer import algorithm` 은 **별개의 모듈 객체**를
+        # 만든다 (sys.modules["optimizer"] ≠ __main__). 그래서 등록이 저쪽
+        # 레지스트리로 가버린다 — 여기서 다시 합쳐 준다.
+        other = getattr(sys.modules.get("optimizer"), "OPTIMIZERS", None)
+        if other is not None and other is not OPTIMIZERS:
+            for k, v in other.items():
+                OPTIMIZERS.setdefault(k, v)
+        added += sorted(set(OPTIMIZERS) - before)
+    return added
+
+
 if __name__ == "__main__":
     import argparse
 
     _ap = argparse.ArgumentParser(description="optimizer — 자가 점검 또는 프로세스 분리 스텝")
+    _ap.add_argument("--plugin", action="append", default=[], metavar="MODULE",
+                     help="알고리즘이 정의된 모듈 (예: algo_template). 반복 지정 가능")
     _ap.add_argument("--serve-step", action="store_true",
                      help="파일 기반 프로세스 분리 실행의 optimizer 한 스텝을 수행")
-    _ap.add_argument("--optimizer", choices=list(OPTIMIZERS), default="random")
+    # choices 를 걸지 않는다 — 플러그인 알고리즘은 파서 생성 후에 등록되므로
+    # argparse 가 먼저 거부해 버린다. 검증은 플러그인 로드 뒤에 직접 한다.
+    _ap.add_argument("--optimizer", default="random")
     _ap.add_argument("--dir", type=str, default=None, help="교환 디렉토리")
     _ap.add_argument("--seed", type=int, default=0)
     _ap.add_argument("--budget", type=int, default=780)
     _args = _ap.parse_args()
+
+    _added = load_plugins(_args.plugin)
+    if _args.optimizer not in OPTIMIZERS:
+        raise SystemExit(
+            f"알 수 없는 optimizer {_args.optimizer!r}. 사용 가능: "
+            f"{sorted(OPTIMIZERS)}"
+            + (f" (플러그인 {_args.plugin} 이 추가한 것: {_added})" if _added else ""))
 
     if _args.serve_step:  # runner 가 서브프로세스로 호출하는 경로
         assert _args.dir, "--serve-step 에는 --dir 필요"
