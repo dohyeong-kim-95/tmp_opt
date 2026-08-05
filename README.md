@@ -19,6 +19,7 @@
 | `make_dataset.py` | **관측 데이터셋 생성** — one-hot 스크리닝 / 무작위 / 반복측정 설계 → `obs.jsonl` |
 | `algo_template.py` | **새 알고리즘 템플릿** — 함수 하나로 추가. 복사해서 시작 |
 | `accept.py` | **시뮬레이션 환경 완료조건 검사** — 참값 대조로 4항목 판정 |
+| `examples/` | **최소 실행 코드** — calculator 가 optimizer 를 소유하는 두 형태 |
 | `lesson_learned.md` | 합성 벤치마크 시대에서 건진 것 (설계·알고리즘·관측모델 교훈) |
 | `doc/algo/` | 알고리즘 소개 문서 (`xgb_tr`, Chow-Liu 트리 EDA) |
 
@@ -70,53 +71,82 @@
 run 간 비교 시에는 같은 벤치마크의 모든 관측을 합친 **pooled 스케일러**로
 재점수화한다 (run마다 정규화 기준이 달라 직접 비교가 불가하기 때문).
 
-## 쓰는 방법 세 가지 — 루프를 누가 소유하나
+## 루프를 누가 소유하나 — ask-and-tell
 
-같은 알고리즘을 세 방식으로 부를 수 있다. **익숙한 것부터 골라 쓰면 된다.**
-
-### ① `optimize()` — 한 번 호출로 끝 (`minimize(f, ...)` 스타일)
-
-`scipy.optimize.minimize` / `optuna.study.optimize` 처럼 **최적화기가 루프를
-소유**하는, 가장 널리 쓰이는 형태다. 이 방식의 표준 명칭은 없고 보통
-**objective-function interface**(또는 `minimize()`-style, callback style)라
-부른다. 구조적으로는 **제어 역전**(inversion of control, "Hollywood
-principle — don't call us, we'll call you") 이다.
+이 시스템은 **optimizer 가 측정 함수를 호출하지 않는다.** 측정(calculator)이
+주도권을 갖고, optimizer 에게 "다음에 뭘 재볼까" 를 묻는다. 이 인터페이스의
+표준 명칭이 **ask-and-tell** 이다 (CMA-ES(Hansen) 유래. Optuna·Nevergrad·
+scikit-optimize·Ax 가 모두 같은 용어를 쓴다).
 
 ```python
-from calculator import SurfaceCalculator
-from runner import optimize
-
-calc = SurfaceCalculator.from_jsonl("obs.jsonl")
-res = optimize("xgb_tr", calc, budget=800)
-print(res["best_x"], res["best_score"])
+x = opt.ask(state)                # "다음에 뭘 재볼까?"  → optimizer 가 답한다
+y_raw = 측정(x)                    # 측정은 소유자가 — optimizer 는 관여 안 함
+state = opt.tell(state, x, y_raw)  # "이렇게 나왔다"     → optimizer 에 통보
 ```
 
-### ② `Session` — 루프를 당신이 소유 (ask-and-tell)
+흔히 보는 반대쪽 형태 — `scipy.optimize.minimize(f, ...)` 나
+`optuna.study.optimize(objective)` 처럼 **optimizer 가 루프를 소유하고 당신의
+함수를 콜백으로 부르는** 방식 — 은 표준 명칭이 딱히 없고 보통
+**objective-function interface**(또는 `minimize()`-style, callback style)라
+부른다. 구조적으로는 **제어 역전**(inversion of control, "Hollywood principle
+— don't call us, we'll call you")이다. 측정이 이 프로세스 밖에 있으면 쓸 수
+없으므로 여기서는 제공하지 않는다.
 
-측정이 이 프로세스 밖에 있을 때(실측 장비, 사람의 수작업, 다른 서비스).
-**ask-and-tell interface** 라는 이름은 CMA-ES(Hansen)에서 왔고 Optuna·
-Nevergrad·scikit-optimize·Ax 가 모두 같은 용어를 쓴다.
+### ① 가장 단순한 형태 — 알고리즘은 함수 하나, 상태는 파일
+
+[`examples/owner_minimal.py`](examples/owner_minimal.py) — 알고리즘이 히스토리만
+보고 판단할 수 있으면(top-k GA·TPE·EDA 등) 이게 제일 짧다:
 
 ```python
+def dummy_algo(data):                  # data = obs.jsonl 을 읽은 그대로
+    X, s = data["X"], data["scores"]   # + [0,1] 점수
+    ...
+    return [다음_x, 다음_x, ...]
+
+while 예산_남음:
+    for x in dummy_algo(data):
+        y_raw = 측정(x)                                    # ← 루프의 주인은 당신
+        save_observations(obs, x, convert_y_raw(y_raw), append=True)
+        data 갱신
+```
+
+**관측 파일이 곧 상태**다. 중단해도 파일만 있으면 이어서 돌고, 사람이 손으로
+한 줄 추가해도 즉시 반영된다. state·ask/tell·클래스가 전혀 없다.
+
+### ② 히스토리로 복원 안 되는 기억이 필요할 때 — `Session`
+
+SA 의 "현재 해", PSO 의 속도처럼 관측에 안 적히는 상태가 있으면 `Session` 을
+쓴다. 루프의 주인은 여전히 당신이다.
+[`examples/owner_inprocess.py`](examples/owner_inprocess.py)
+
+```python
+from runner import Session
+
 sess = Session("xgb_tr", budget=800)
 while not sess.done:
-    x = sess.next_x()               # "다음에 뭘 재볼까?"
-    y_raw = 어딘가에서_측정(x)       # 측정은 당신이 — optimizer 는 관여 안 함
-    sess.report(x, y_raw)           # "이렇게 나왔다"
+    x = sess.next_x()               # 다음에 측정할 X 하나
+    y_raw = 어딘가에서_측정(x)       # 루프의 주인은 당신(calculator 쪽)
+    sess.report(x, y_raw)
 print(sess.best())
 ```
 
-### ③ 프로세스 분리 — 측정이 다른 프로그램/기계
+배치는 내부 큐가 흡수하므로 소유자는 배치 개념을 몰라도 된다.
 
-`--separate` 로 optimizer 와 calculator 를 별도 프로세스로 띄우고 파일로만
-통신한다. 공유 메모리가 없으므로 in-process 우회가 물리적으로 불가능하다.
+### ③ 소유자가 다른 프로그램·기계일 때 — 파일 교환
 
-```bash
-python runner.py --optimizer xgb_tr --surface-data obs.jsonl --budget 800 --separate xchg/
+optimizer 를 **한 스텝짜리 프로그램**으로 부른다. 소유자는 그 출력(`x.txt`)을
+읽어 측정하고 `y_raw.bin` 을 쓴 뒤 다시 부른다. optimizer 는 매 호출이 새
+프로세스이고 `state.pkl` + `history.jsonl` 이 스텝 간 유일한 기억이다.
+
+```
+반복:
+  python optimizer.py --serve-step --optimizer xgb_tr --dir xchg/ --budget 800
+      → xchg/x.txt 에 다음 후보, 또는 xchg/done (예산 소진)
+  측정하고 xchg/y_raw.bin 에 기록          ← 소유자가 하는 일
 ```
 
-셋 다 같은 알고리즘·같은 점수 파이프라인을 쓴다. ①은 ②의 얇은 래퍼이고,
-②는 아래의 `ask`/`tell` 을 한 점씩 쓰도록 감싼 것이다.
+`runner.py --separate` 는 이 순서를 대신 강제해 주는 **테스트용 편의**일 뿐이다
+(개발 중 회귀 확인용). 실제 배치에서는 소유자 쪽 프로그램이 위 루프를 돈다.
 
 ## Optimizer (ask-tell, stateless)
 

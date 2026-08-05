@@ -114,34 +114,6 @@ def run_single(
     )
 
 
-def optimize(optimizer_name: str, calc, budget: int = 800, seed: int = 0,
-             scorer_name: str = "chebyshev", **kw) -> dict:
-    """**한 번 호출로 끝나는 진입점** — `scipy.optimize.minimize(f, ...)` 스타일.
-
-    ask-tell 이 익숙하지 않다면 이것부터 쓰면 된다. 루프·상태·점수화를 전부
-    숨기고 결과만 돌려준다:
-
-        from calculator import SurfaceCalculator
-        from runner import optimize
-
-        calc = SurfaceCalculator.from_jsonl("obs.jsonl")
-        res = optimize("xgb_tr", calc, budget=800)
-        print(res["best_x"], res["best_score"])
-
-    Returns:
-        {"best_x": (30,) int64, "best_score": float, "best_y": (6,) float,
-         "X": (N,30), "Y": (N,6), "scores": (N,), "elapsed_sec": float,
-         "result": RunResult}
-    """
-    r = run_single(optimizer_name, calc, seed, budget, scorer_name, **kw)
-    s = r.final_state["scores_hist"]
-    i = int(np.argmax(s))
-    return {"best_x": r.X[i].copy(), "best_score": float(s[i]),
-            "best_y": r.Y_raw[i].copy(), "X": r.X, "Y": r.Y_raw,
-            "scores": np.asarray(s).copy(),
-            "elapsed_sec": r.elapsed_sec, "result": r}
-
-
 class Session:
     """**루프를 당신이 소유하는 진입점** — 한 점씩 묻고 답한다.
 

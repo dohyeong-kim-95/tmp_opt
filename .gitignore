@@ -9,3 +9,4 @@ obs.jsonl
 *.npz
 xchg/
 ckpt/
+run_obs.jsonl
