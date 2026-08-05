@@ -25,22 +25,20 @@
 from __future__ import annotations
 
 import argparse
-import subprocess
-import sys
 import tempfile
 from pathlib import Path
 
 import numpy as np
 
-from calculator import (OBJECTIVE_NAMES, NoDataError, SurfaceCalculator,
+from calculator import (OBJECTIVE_NAMES, SurfaceCalculator,
                         load_observations, save_observations)
 from make_dataset import SimulatedInstrument, build_dataset
-from optimizer import OPTIMIZERS, convert_y_raw, load_history, _mask_extents
+from optimizer import OPTIMIZERS, convert_y_raw, load_history
 from runner import run_single, run_separated
 from space import SearchSpace
 
 _HERE = Path(__file__).resolve().parent
-_PX, _SC = [0, 1, 3, 4], [2, 5]  # 픽셀 목적 / 스칼라 목적
+_PX = [0, 1, 3, 4]  # 픽셀 목적 (나머지 [2, 5] 는 스칼라)
 
 
 def _iou(a: np.ndarray, b: np.ndarray) -> float:

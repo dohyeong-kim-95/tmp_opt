@@ -572,7 +572,6 @@ class OptimizerBase:
         # 일부 알고리즘(SA 온도 스케줄 등)이 진행률 계산에 예산을 사용한다.
         self.total_budget = total_budget
         self.scorer_name = scorer_name
-        self.scorer = SCORERS[scorer_name]
         # 1(기본) = 매 tell 전체 재적합·재점수. 장기 실행(true-optimum 100K 등)
         # 은 크게 잡아 O(N²) 비용을 피한다 — 그 사이 새 관측만 기존 스케일러로
         # 점수화한다 (단위: 평가 횟수).
@@ -652,32 +651,6 @@ class OptimizerBase:
     def _update(self, state: dict, X_hist: np.ndarray, scores_hist: np.ndarray) -> dict:
         """알고리즘별 상태 갱신 훅. 최신 재정규화 점수의 전체 히스토리를 받는다."""
         raise NotImplementedError
-
-    # ─── 서브클래스 공용 헬퍼 ──────────────────────────────────────────────
-
-    def _random_batch(self, rng: np.random.Generator, n: int) -> np.ndarray:
-        return self.space.sample(rng, n)
-
-    def _mutate(
-        self, rng: np.random.Generator, x: np.ndarray, rate: float = 1.0 / 30
-    ) -> np.ndarray:
-        """ordinal 변수용 mutation: 대체로 ±1 스텝, 가끔 랜덤 값 점프.
-
-        각 컬럼이 확률 rate 로 변이된다. 최소 1개 컬럼은 반드시 변이시켜
-        '아무 변화 없는 자식'이 나오는 것을 막는다.
-        signed 범위: 점프는 [x_min, x_max] 균등 — [0, card) 산술 금지.
-        """
-        x = x.copy()
-        mask = rng.random(self.space.n_cols) < rate
-        if not mask.any():
-            mask[rng.integers(self.space.n_cols)] = True
-        for c in np.flatnonzero(mask):
-            if rng.random() < 0.8:  # ordinal 구조 활용: 이웃 값으로 이동
-                x[c] += rng.choice([-1, 1])
-            else:  # 탈출용 랜덤 점프
-                x[c] = rng.integers(self.space.x_min[c], self.space.x_max[c] + 1)
-        return self.space.clip(x)
-
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1545,7 +1518,7 @@ class GOMEABlockOptimizer(OptimizerBase):
     def ask(self, state: dict) -> tuple[np.ndarray, dict]:
         rng = _rng_load(state)
         if state["phase"] == "init":
-            batch = self._random_batch(rng, self.pop_size)  # 초기 population
+            batch = self.space.sample(rng, self.pop_size)  # 초기 population
             state["pending"] = ("init", -1)
             _rng_save(state, rng)
             return batch, state
@@ -1585,7 +1558,7 @@ class GOMEABlockOptimizer(OptimizerBase):
                 return x[None, :], state
 
         # population 이 수렴해 새 제안이 없음 → 랜덤 이민자로 다양성 주입
-        batch = self._random_batch(rng, 1)
+        batch = self.space.sample(rng, 1)
         state["pending"] = ("rand", -1)
         _rng_save(state, rng)
         return batch, state
