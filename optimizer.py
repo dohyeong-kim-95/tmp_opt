@@ -701,6 +701,10 @@ class OptimizerBase:
 # ──────────────────────────────────────────────────────────────────────────────
 
 
+#: 알고리즘 상태가 사는 state dict 안의 키 — 내부 키와 섞이지 않게 격리한다
+_ALGO_STATE: str = "algo_state"
+
+
 class Ctx:
     """알고리즘이 쓰는 공간·예산·설정과 헬퍼. **탐색 상태는 담지 않는다.**"""
 
@@ -771,20 +775,24 @@ def algorithm(name: str, state: dict | None = None, **cfg):
 
             def init_state(self, seed: int) -> dict:
                 st = super().init_state(seed)
-                st.update(copy.deepcopy(state) if state else {})
+                # 알고리즘 상태는 **별도 네임스페이스**에 둔다. 평평하게 합치면
+                # 사용자가 키를 "rng"/"n_evals" 로 지었을 때 내부 상태를 조용히
+                # 덮어써서 실행이 깨진다 (실제로 그랬다).
+                st[_ALGO_STATE] = copy.deepcopy(state) if state else {}
                 return st
 
             def ask(self, st: dict) -> tuple[np.ndarray, dict]:
                 rng = _rng_load(st)
                 pool = {"X": st["X_hist"], "Y": st["Y_raw_hist"],
-                        "scores": st["scores_hist"], "state": st,
+                        "scores": st["scores_hist"],
+                        "state": st.setdefault(_ALGO_STATE, {}),
                         "rng": rng, "ctx": self.ctx}
                 out = fn(**{k: pool[k] for k in params})
                 if isinstance(out, tuple) and len(out) == 2 and \
                         isinstance(out[1], dict):
                     xs, new_state = out
-                    if new_state is not st:
-                        st.update(new_state)
+                    if new_state is not st[_ALGO_STATE]:
+                        st[_ALGO_STATE].update(new_state)
                 else:
                     xs = out
                 batch = np.atleast_2d(np.asarray(xs, dtype=np.int64))
