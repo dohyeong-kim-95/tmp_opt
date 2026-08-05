@@ -575,10 +575,9 @@ def plot_shmoo(
     핵심: 마스크는 저장할 필요가 없다. best 해의 X 는 history 에 있고,
     calculator 는 X 에 대해 결정적이므로 재평가로 복원한다 (true-optimum·
     anytime 곡선과 동일한 post-hoc 원리):
-      - 무노이즈 재평가 → 참 타원 모양 ("이 해가 실제로 어떻게 생겼나")
-      - 노이즈 재평가   → 경계 flip 이 만드는 shmoo 특유의 너덜한 경계
-    각 패널에 max-height / max-width 측정 현(chord)을 겹쳐 y11..y22 가
-    어떻게 뽑히는지 보인다.
+    타원 관측은 결정적이다 (노이즈는 격자 양자화뿐) — 그래서 패널은 mask1 /
+    mask2 두 장이고, 각 패널에 max-height / max-width 측정 현(chord)을 겹쳐
+    y11..y22 가 어떻게 뽑히는지 보인다.
     """
     print(f"[Shmoo] {optimizer_name} on {benchmark_name} — budget {budget}, seed {seed}")
     r = run_single(optimizer_name, benchmark_name, seed, budget)
@@ -587,20 +586,17 @@ def plot_shmoo(
     best_x = r.X[i]
 
     calc = BENCHMARKS[benchmark_name](noise_seed=seed)
-    clean = calc.evaluate(best_x, noisy=False)  # 참 모양 (X 만으로 복원)
-    noisy = calc.evaluate(best_x, noisy=True)   # 노이즈 관측 예시 (경계 flip)
+    obs = calc.evaluate(best_x, noisy=False)  # 마스크는 X 만으로 결정적 복원
 
     from matplotlib.colors import ListedColormap
     color = OPTIMIZER_COLORS[optimizer_name]
     cmap = ListedColormap(["#f2f2f2", color])
 
     panels = [  # (제목, 마스크, y_height 이름, y_width 이름)
-        ("mask1 · true", clean["mask1"][0], "y11", "y12"),
-        ("mask1 · noisy", noisy["mask1"][0], "y11", "y12"),
-        ("mask2 · true", clean["mask2"][0], "y21", "y22"),
-        ("mask2 · noisy", noisy["mask2"][0], "y21", "y22"),
+        ("mask1", obs["mask1"][0], "y11", "y12"),
+        ("mask2", obs["mask2"][0], "y21", "y22"),
     ]
-    fig, axes = plt.subplots(2, 2, figsize=(8.5, 8.8), dpi=150)
+    fig, axes = plt.subplots(1, 2, figsize=(8.5, 4.8), dpi=150)
     for ax, (title, m, hname, wname) in zip(axes.flat, panels):
         g = m.shape[0]
         ax.imshow(m.astype(float), cmap=cmap, interpolation="nearest",
@@ -627,11 +623,11 @@ def plot_shmoo(
     fig.suptitle(
         f"Shmoo plot — best solution masks\n"
         f"{optimizer_name} on {benchmark_name}, budget {budget}  ·  "
-        "chords = measured max-height / max-width  ·  "
-        "noise = boundary-pixel flips\n"
-        "(masks recovered by re-evaluation from X, not stored)",
+        "chords = measured max-height / max-width\n"
+        "(masks recovered by re-evaluation from X, not stored — "
+        "ellipse observation is deterministic up to grid quantization)",
         fontsize=10, y=0.99)
-    fig.tight_layout(rect=(0, 0, 1, 0.92))
+    fig.tight_layout(rect=(0, 0, 1, 0.86))
     fig.savefig(VIS_DIR / f"shmoo_{benchmark_name}_{optimizer_name}.png")
     plt.close(fig)
     print(f"저장: vis/shmoo_{benchmark_name}_{optimizer_name}.png")

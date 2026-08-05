@@ -327,7 +327,7 @@ def _mask_extents(mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 
     max height = 컬럼별 True 개수의 최대(가장 긴 세로 현),
     max width  = 행별 True 개수의 최대(가장 긴 가로 현).
-    개수 기반이라 경계 flip 노이즈에 ±수 픽셀 수준으로만 흔들린다.
+    개수 기반이라 가장자리 픽셀이 흔들려도 ±수 픽셀 수준으로만 반응한다.
     """
     height = mask.sum(axis=1).max(axis=1)  # (b, G) 컬럼 카운트 → 최대
     width = mask.sum(axis=2).max(axis=1)   # (b, G) 행 카운트 → 최대
