@@ -70,6 +70,54 @@
 run 간 비교 시에는 같은 벤치마크의 모든 관측을 합친 **pooled 스케일러**로
 재점수화한다 (run마다 정규화 기준이 달라 직접 비교가 불가하기 때문).
 
+## 쓰는 방법 세 가지 — 루프를 누가 소유하나
+
+같은 알고리즘을 세 방식으로 부를 수 있다. **익숙한 것부터 골라 쓰면 된다.**
+
+### ① `optimize()` — 한 번 호출로 끝 (`minimize(f, ...)` 스타일)
+
+`scipy.optimize.minimize` / `optuna.study.optimize` 처럼 **최적화기가 루프를
+소유**하는, 가장 널리 쓰이는 형태다. 이 방식의 표준 명칭은 없고 보통
+**objective-function interface**(또는 `minimize()`-style, callback style)라
+부른다. 구조적으로는 **제어 역전**(inversion of control, "Hollywood
+principle — don't call us, we'll call you") 이다.
+
+```python
+from calculator import SurfaceCalculator
+from runner import optimize
+
+calc = SurfaceCalculator.from_jsonl("obs.jsonl")
+res = optimize("xgb_tr", calc, budget=800)
+print(res["best_x"], res["best_score"])
+```
+
+### ② `Session` — 루프를 당신이 소유 (ask-and-tell)
+
+측정이 이 프로세스 밖에 있을 때(실측 장비, 사람의 수작업, 다른 서비스).
+**ask-and-tell interface** 라는 이름은 CMA-ES(Hansen)에서 왔고 Optuna·
+Nevergrad·scikit-optimize·Ax 가 모두 같은 용어를 쓴다.
+
+```python
+sess = Session("xgb_tr", budget=800)
+while not sess.done:
+    x = sess.next_x()               # "다음에 뭘 재볼까?"
+    y_raw = 어딘가에서_측정(x)       # 측정은 당신이 — optimizer 는 관여 안 함
+    sess.report(x, y_raw)           # "이렇게 나왔다"
+print(sess.best())
+```
+
+### ③ 프로세스 분리 — 측정이 다른 프로그램/기계
+
+`--separate` 로 optimizer 와 calculator 를 별도 프로세스로 띄우고 파일로만
+통신한다. 공유 메모리가 없으므로 in-process 우회가 물리적으로 불가능하다.
+
+```bash
+python runner.py --optimizer xgb_tr --surface-data obs.jsonl --budget 800 --separate xchg/
+```
+
+셋 다 같은 알고리즘·같은 점수 파이프라인을 쓴다. ①은 ②의 얇은 래퍼이고,
+②는 아래의 `ask`/`tell` 을 한 점씩 쓰도록 감싼 것이다.
+
 ## Optimizer (ask-tell, stateless)
 
 optimizer 인스턴스는 설정만 갖고, 탐색 상태(히스토리 포함)는 순수 dict 다.

@@ -114,6 +114,91 @@ def run_single(
     )
 
 
+def optimize(optimizer_name: str, calc, budget: int = 800, seed: int = 0,
+             scorer_name: str = "chebyshev", **kw) -> dict:
+    """**한 번 호출로 끝나는 진입점** — `scipy.optimize.minimize(f, ...)` 스타일.
+
+    ask-tell 이 익숙하지 않다면 이것부터 쓰면 된다. 루프·상태·점수화를 전부
+    숨기고 결과만 돌려준다:
+
+        from calculator import SurfaceCalculator
+        from runner import optimize
+
+        calc = SurfaceCalculator.from_jsonl("obs.jsonl")
+        res = optimize("xgb_tr", calc, budget=800)
+        print(res["best_x"], res["best_score"])
+
+    Returns:
+        {"best_x": (30,) int64, "best_score": float, "best_y": (6,) float,
+         "X": (N,30), "Y": (N,6), "scores": (N,), "elapsed_sec": float,
+         "result": RunResult}
+    """
+    r = run_single(optimizer_name, calc, seed, budget, scorer_name, **kw)
+    s = r.final_state["scores_hist"]
+    i = int(np.argmax(s))
+    return {"best_x": r.X[i].copy(), "best_score": float(s[i]),
+            "best_y": r.Y_raw[i].copy(), "X": r.X, "Y": r.Y_raw,
+            "scores": np.asarray(s).copy(),
+            "elapsed_sec": r.elapsed_sec, "result": r}
+
+
+class Session:
+    """**루프를 당신이 소유하는 진입점** — 한 점씩 묻고 답한다.
+
+    측정이 이 프로세스 밖에 있을 때(실측 장비, 사람의 수작업, 다른 서비스)
+    쓴다. optimizer 는 측정 함수를 전혀 모른다:
+
+        sess = Session("xgb_tr", budget=800, seed=0)
+        while not sess.done:
+            x = sess.next_x()              # 다음에 측정할 X 하나
+            y_raw = 어딘가에서_측정(x)      # 루프의 주인은 당신
+            sess.report(x, y_raw)          # 결과 통보
+        print(sess.best())
+
+    배치는 내부 큐가 흡수하므로 호출자는 배치 개념을 몰라도 된다. 다만 큐에
+    남은 후보는 갱신 전 정보로 만들어진 것이라, 한 점씩 report 해도 알고리즘이
+    그 즉시 반응하지는 않는다 (population 계열은 원래 그렇게 동작한다).
+    """
+
+    def __init__(self, optimizer_name: str, budget: int = 800, seed: int = 0,
+                 space: SearchSpace | None = None, **kw) -> None:
+        self.opt: OptimizerBase = OPTIMIZERS[optimizer_name](
+            space or SearchSpace(), total_budget=budget, **kw)
+        self.state = self.opt.init_state(seed)
+        self.budget = budget
+        self._queue: list = []
+
+    @property
+    def n_evals(self) -> int:
+        return int(self.state["n_evals"])
+
+    @property
+    def done(self) -> bool:
+        return self.n_evals >= self.budget
+
+    def next_x(self) -> np.ndarray:
+        """다음에 평가할 X 하나 (30,)."""
+        if self.done:
+            raise RuntimeError(f"예산 {self.budget} 소진 — done 을 먼저 확인할 것")
+        if not self._queue:
+            batch, self.state = self.opt.ask(self.state)
+            self._queue = [row for row in batch[: self.budget - self.n_evals]]
+        return self._queue.pop(0)
+
+    def report(self, x: np.ndarray, y_raw) -> None:
+        """방금 측정한 (x, y_raw) 를 통보한다. y_raw 는 calculator 계약과 동일."""
+        self.state = self.opt.tell(self.state, np.atleast_2d(x), y_raw)
+
+    def best(self) -> dict:
+        if self.n_evals == 0:
+            raise RuntimeError("아직 관측이 없다")
+        s = self.state["scores_hist"]
+        i = int(np.argmax(s))
+        return {"best_x": self.state["X_hist"][i].copy(),
+                "best_score": float(s[i]),
+                "best_y": self.state["Y_raw_hist"][i].copy()}
+
+
 def run_separated(
     optimizer_name: str,
     surface_data: str | Path,
