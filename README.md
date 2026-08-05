@@ -14,7 +14,7 @@
 |---|---|
 | `space.py` | **탐색 공간 표준 명세** — signed 정수 범위 SearchSpace. 임의의 문제 기하(x_min/x_max/blocks)가 여기를 통과해 표준화되고, 나머지 전부가 이 인터페이스만 소비한다 |
 | `calculator.py` | 문제 정의 — **X → raw y_raw 계산기**. 실측 관측으로 세운 반응표면 `SurfaceCalculator` |
-| `optimizer.py` | **나머지 전부** — stateless optimizer 11종 + 히스토리 누적 + 온라인 스케일링/sense 통일/scalarization (공유 score 파이프라인) + 파일 교환 셸(x.txt/y_raw.bin) + 체크포인트(history.jsonl/state.pkl) |
+| `optimizer.py` | **나머지 전부** — optimizer 11종(9종은 `@simple_algorithm` 함수, 2종은 클래스) + 히스토리 누적 + 온라인 스케일링/sense 통일/scalarization (공유 score 파이프라인) + 파일 교환 셸(x.txt/y_raw.bin) + 체크포인트(history.jsonl/state.pkl) |
 | `runner.py` | calculator ↔ optimizer 를 **반복 호출하는 기계** (ask → 순차 평가 → tell) |
 | `make_dataset.py` | **관측 데이터셋 생성** — one-hot 스크리닝 / 무작위 / 반복측정 설계 → `obs.jsonl` |
 | `algo_template.py` | **새 알고리즘 템플릿** — 함수 하나로 추가. 복사해서 시작 |
@@ -163,6 +163,12 @@ while budget_left:
     # ... calculator 로 순차 평가 ...
     state = opt.tell(state, X_batch, Y_raw)  # 증분 raw 관측 통보
 ```
+
+구현 11종 중 **9종은 `@simple_algorithm` 함수 하나**로 쓰여 있다
+(`random`, `ga`, `sa`, `pso`, `aco`, `tpe`, `xgb_surrogate`, `eda_tree`,
+`xgb_tr`). 클래스로 남은 것은 상태 기계가 큰 2종뿐이다 —
+`blockwise_coord`(phase/sweep 커서 + 캐시), `gomea_block`(FOS 순회 상태).
+계약은 둘이 완전히 같다.
 
 구현: `random`(baseline), `blockwise_coord`, `ga`, `sa`, `pso`, `aco`,
 `tpe`(직접 구현), `xgb_surrogate`, `eda_tree`(Chow-Liu 의존성 트리 EDA —
