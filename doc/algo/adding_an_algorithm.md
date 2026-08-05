@@ -4,17 +4,23 @@
 `super()` 도 없다. 복사해서 시작할 파일: [`algo_template.py`](../../algo_template.py)
 
 ```python
-from optimizer import algorithm
+from optimizer import simple_algorithm
 
-@algorithm("my_hill", state={"cur": None}, step=2)
-def my_hill(X, scores, state, rng, ctx):
+@simple_algorithm("my_hill", state={"cur": None}, step=2)
+def my_hill(data):
+    X, s, st, rng, ctx = (data["X"], data["scores"], data["state"],
+                          data["rng"], data["ctx"])
     if len(X) == 0:
         return ctx.sample(rng, 1)                 # 첫 호출 — 히스토리가 비었다
-    i = len(scores) - 1                            # 방금 평가된 점
-    if state["cur"] is None or scores[i] > scores[state["cur"]]:
-        state["cur"] = i
-    return [ctx.mutate(rng, X[state["cur"]], rate=ctx.cfg["step"] / ctx.space.n_cols)]
+    i = len(s) - 1                                 # 방금 평가된 점
+    if st["cur"] is None or s[i] > s[st["cur"]]:
+        st["cur"] = i
+    return [ctx.mutate(rng, X[st["cur"]], rate=data["cfg"]["step"] / ctx.space.n_cols)]
 ```
+
+**인자 하나, 반환 하나.** `examples/owner_minimal.py` 와 같은 모양이고, 거기서
+직접 쓰던 루프를 프레임워크가 돌려주는 것만 다르다. 인자를 dict 대신 이름으로
+받고 싶으면 `@algorithm` 을 쓴다 (§2 참조 — 계약은 동일하다).
 
 ```bash
 python runner.py --plugin algo_template --optimizer my_hill --surface-data obs.jsonl
@@ -41,7 +47,10 @@ state = opt.tell(state, x, y)   # "이렇게 나왔다"
 
 ## 2. 함수 계약
 
-인자는 **선언한 것만** 넘어온다 (이름으로 매칭). 필요 없으면 안 적으면 된다.
+`@simple_algorithm` 은 인자를 `data` dict 하나로 준다. 키는 아래 표와 같다
+(`data["X"]`, `data["scores"]`, …). `@algorithm` 을 쓰면 같은 것들을 **선언한
+것만** 이름으로 받는다 — 필요 없으면 안 적으면 된다. 둘은 완전히 같은 계약이고
+아무 차이 없이 섞어 쓸 수 있다.
 
 | 인자 | 형상 | 내용 |
 |---|---|---|

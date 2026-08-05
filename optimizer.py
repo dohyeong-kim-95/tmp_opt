@@ -2066,6 +2066,53 @@ def algorithm(name: str, state: dict | None = None, **cfg):
     return decorate
 
 
+def simple_algorithm(name: str, state: dict | None = None, **cfg):
+    """`algo(data) -> [다음 X, ...]` — **인자 하나, 반환 하나.**
+
+    `examples/owner_minimal.py` 와 같은 모양이다. 인자 이름을 고를 필요도,
+    무엇을 선언할지 고민할 필요도 없다. 필요한 건 전부 `data` 안에 있다:
+
+        data["X"]      (n, 30) int64   지금까지 평가된 X
+        data["Y"]      (n, 6)  float   대응 raw 관측
+        data["scores"] (n,)    float   [0,1] 점수, 클수록 좋음
+        data["state"]  dict            라운드 간 기억 (**제자리 수정**하면 된다)
+        data["rng"]    Generator       난수 — 반드시 이것만
+        data["space"]  SearchSpace     x_min / x_max / n_cols / sample / clip
+        data["cfg"]    dict            @simple_algorithm 에 넘긴 하이퍼파라미터
+        data["ctx"]    Ctx             헬퍼 (sample / mutate / top_k / clip)
+
+    히스토리만 보면 되는 알고리즘은 `data["state"]` 를 아예 안 써도 된다
+    (그때는 `examples/owner_minimal.py` 처럼 파일만으로도 돌릴 수 있다).
+    SA 의 '현재 해', PSO 의 속도처럼 관측에 안 적히는 기억이 필요하면
+    `data["state"]` 에 넣는다 — pickle 가능한 값만.
+
+        @simple_algorithm("my_ga", n_elite=8, batch=4)
+        def my_ga(data):
+            X, s, rng = data["X"], data["scores"], data["rng"]
+            if len(X) < data["cfg"]["n_elite"]:
+                return data["ctx"].sample(rng, data["cfg"]["n_elite"])
+            elite = data["ctx"].top_k(X, s, data["cfg"]["n_elite"])
+            return [data["ctx"].mutate(rng, elite[rng.integers(len(elite))])
+                    for _ in range(data["cfg"]["batch"])]
+
+    `@algorithm` 과 완전히 같은 계약이다 — 인자를 이름으로 받느냐 dict 하나로
+    받느냐의 차이뿐이고, runner·체크포인트·프로세스 분리 전부 동일하게 돈다.
+    """
+    def decorate(fn):
+        @algorithm(name, state=state, **cfg)
+        def _bundled(X, Y, scores, state, rng, ctx):
+            return fn({"X": X, "Y": Y, "scores": scores, "state": state,
+                       "rng": rng, "space": ctx.space, "cfg": ctx.cfg,
+                       "budget": ctx.budget, "ctx": ctx})
+
+        _bundled.__name__ = fn.__name__
+        _bundled.__doc__ = fn.__doc__
+        fn.optimizer_cls = _bundled.optimizer_cls
+        return fn
+
+    return decorate
+
+
 def load_plugins(modules) -> list[str]:
     """알고리즘이 정의된 모듈을 import 해 레지스트리에 올린다.
 
