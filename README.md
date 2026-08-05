@@ -17,6 +17,7 @@
 | `optimizer.py` | **나머지 전부** — stateless optimizer 11종 + 히스토리 누적 + 온라인 스케일링/sense 통일/scalarization (공유 score 파이프라인) + 파일 교환 셸(x.txt/y_raw.bin) + 체크포인트(history.jsonl/state.pkl) |
 | `runner.py` | calculator ↔ optimizer 를 **반복 호출하는 기계** (ask → 순차 평가 → tell) |
 | `make_dataset.py` | **관측 데이터셋 생성** — one-hot 스크리닝 / 무작위 / 반복측정 설계 → `obs.jsonl` |
+| `accept.py` | **시뮬레이션 환경 완료조건 검사** — 참값 대조로 4항목 판정 |
 | `lesson_learned.md` | 합성 벤치마크 시대에서 건진 것 (설계·알고리즘·관측모델 교훈) |
 | `doc/algo/` | 알고리즘 소개 문서 (`xgb_tr`, Chow-Liu 트리 EDA) |
 
@@ -273,4 +274,21 @@ python runner.py --optimizer ga --surface-data obs.jsonl --budget 780 --separate
 `python space.py` (공간 불변식), `python calculator.py --surface-selfcheck`
 (반응표면 요구 3종 + blob 보간), `python optimizer.py` (전체 optimizer 의
 ask-tell 사이클 + pickle 체크포인트), `python make_dataset.py --selfcheck`
-(설계 불변식 + 블록 구조 복원).
+(설계 불변식 + 블록 구조 복원), `python accept.py` (시뮬레이션 환경 완료조건).
+
+## 시뮬레이션 환경 완료조건 (`accept.py`)
+
+반응표면이 "실제 TEST 의 대역"으로 쓸 만한지를 **참값 대조**로 판정한다.
+시뮬레이션 장치가 참값을 알고 있으므로 주장이 아니라 측정이 된다.
+
+| 완료조건 | 판정 방법 | 현재 |
+|---|---|---|
+| (1) 근방 샘플이 충분하면 마스크·스칼라를 신뢰성 있게 생성 | 관측 1~2컬럼 이웃에서 표면 vs 참값 | 재생 상대오차 0.000, 형상 IoU 0.998 / 보간 0.05~0.06, IoU 0.81 |
+| (2) 근방 샘플이 없으면 근거를 들어 거부 | no_data 표시 + 게이트를 열었을 때 실제로 더 틀리는가 | 커버 영역 오차의 **2.4배** → 거부가 정당 |
+| (3) 최적화 알고리즘과 roundtrip | in-process 11종 + 프로세스 분리 + 체크포인트 재개 | 11/11, 교환파일 6종, 궤적 일치 |
+| (4) 샘플 추가 시 즉시 반영 | no_data 점을 측정·append → 재로드 | `exact` 로 전환, 값·마스크 바이트 동일, 주변 30점 커버리지 편입 |
+
+```bash
+python accept.py            # 전체 (수십 초)
+python accept.py --quick    # 프로세스 분리·전 optimizer 생략
+```

@@ -548,9 +548,32 @@ class SurfaceCalculator:
 
     # ─── blob 보간 (마스크 원형끼리의 형상 보간) ────────────────────────────
 
-    #: blob 반경 프로파일에서 "덩어리가 끊겼다" 로 볼 반경 간격(픽셀).
-    #: 이보다 멀리 떨어져 있는 바깥 픽셀은 본체가 아니라 이상치로 본다.
-    _BLOB_GAP: float = 2.0
+    @staticmethod
+    def _largest_component(mask: np.ndarray) -> np.ndarray:
+        """4-이웃 최대 연결 성분만 남긴다 (본체에서 떨어져 나온 낱개 픽셀 제거).
+
+        실측 마스크에서 가장자리에 흩뿌려지는 이상치를 거르는 **올바른**
+        연산이다 — blob 은 하나의 덩어리라는 것이 이 자료형의 정의이므로.
+        (반경 방향으로 자르는 방식은 각도 bin 이 중심 근처에서 서브픽셀 폭이라
+         본체 자체가 잘려나간다 — 형상이 축 방향만 남은 별이 된다)
+        """
+        if not mask.any():
+            return mask
+        rr, cc = np.nonzero(mask)
+        cen = np.array([rr.mean(), cc.mean()])
+        seed = np.argmin((rr - cen[0]) ** 2 + (cc - cen[1]) ** 2)
+        comp = np.zeros_like(mask)
+        comp[rr[seed], cc[seed]] = True
+        while True:  # 팽창 ∩ 마스크 를 고정점까지 (전부 벡터 연산)
+            grown = comp.copy()
+            grown[1:, :] |= comp[:-1, :]
+            grown[:-1, :] |= comp[1:, :]
+            grown[:, 1:] |= comp[:, :-1]
+            grown[:, :-1] |= comp[:, 1:]
+            grown &= mask
+            if grown.sum() == comp.sum():
+                return comp
+            comp = grown
 
     @classmethod
     def _blob_profile(cls, mask: np.ndarray,
@@ -558,18 +581,16 @@ class SurfaceCalculator:
         """boolean blob → (무게중심, 각도별 반경 프로파일 r(θ)).
 
         마스크를 픽셀 집합이 아니라 **형상**으로 다룬다. 무게중심에서 본
-        각도 bin 별 경계 반경을 재면 크기·위치·찌그러짐이 (c, r(θ)) 로 분리돼
+        각도 bin 별 최대 반경을 재면 크기·위치·찌그러짐이 (c, r(θ)) 로 분리돼
         서로 다른 blob 사이를 자연스럽게 섞을 수 있다.
 
-        경계 반경은 각 bin 의 **최대** 반경이 아니라 **본체가 연결된 데까지**
-        의 반경이다: bin 안의 반경들을 정렬해 _BLOB_GAP 보다 큰 틈이 처음
-        나타나는 지점에서 끊는다. 실측 마스크에서 가장자리에 붙는 낱개
-        이상치 픽셀이 프로파일을 통째로 부풀리는 것을 막으면서, 깨끗한
-        blob 에는 아무 영향도 주지 않는다 (틈이 없으므로 전부 본체).
+        이상치 제거는 반경이 아니라 **연결성**으로 한다 (`_largest_component`).
+        본체에 붙어 있는 픽셀은 전부 형상의 일부이고, 떨어져 나온 것만 버린다.
         비어 있는 마스크는 (중심, 전부 0) 으로 돌려준다.
         """
-        rr, cc = np.nonzero(mask)
         g = mask.shape[0]
+        mask = cls._largest_component(np.asarray(mask, dtype=bool))
+        rr, cc = np.nonzero(mask)
         if len(rr) == 0:
             return np.array([(g - 1) / 2.0] * 2), np.zeros(n_theta)
         cen = np.array([rr.mean(), cc.mean()])
@@ -578,22 +599,9 @@ class SurfaceCalculator:
         ang = np.arctan2(dy, dx) % (2 * np.pi)
         b = np.minimum((ang / (2 * np.pi) * n_theta).astype(np.int64), n_theta - 1)
 
-        # bin 별로 반경 오름차순 정렬 → 첫 틈 이전까지만 본체로 채택
-        o = np.lexsort((rad, b))
-        bs, rs = b[o], rad[o]
-        new_bin = np.empty(len(bs), dtype=bool)
-        new_bin[0] = True
-        new_bin[1:] = bs[1:] != bs[:-1]
-        brk = np.zeros(len(bs), dtype=bool)
-        brk[1:] = (np.diff(rs) > cls._BLOB_GAP) & ~new_bin[1:]
-        seg = np.cumsum(new_bin | brk)          # 연속 구간 id
-        first = np.zeros(n_theta, dtype=np.int64)
-        first[bs[new_bin]] = seg[new_bin]        # 각 bin 의 첫 구간 = 본체
-        body = seg == first[bs]
-
         prof = np.zeros(n_theta)
         # 픽셀 중심이 아니라 바깥 모서리까지를 반경으로 본다 (반올림 손실 방지)
-        np.maximum.at(prof, bs[body], rs[body] + 0.5)
+        np.maximum.at(prof, b, rad + 0.5)
         # 빈 각도 bin 은 이웃에서 메운다 (blob 은 연결된 덩어리라는 가정)
         idx = np.flatnonzero(prof > 0)
         if len(idx) and len(idx) < n_theta:
@@ -943,12 +951,28 @@ if __name__ == "__main__":
         assert np.array_equal(Y_nm[uniq], Y_obs[uniq]), "마스크 합성 경로에서 관측 재현 실패"
         print("[요구3] 마스크 원형 없이 합성만으로도 측정치 6/6 열 일치")
 
-        # ── blob 보간 점검 ①: 단일 blob 통과가 항등이어야 한다 (부풀림/줄어듦 없음)
+        # ── blob 보간 점검 ①: 단일 blob 통과가 항등이어야 한다.
+        # 측정치(extent)만 보면 안 된다 — 형상이 축 방향만 남은 별로 무너져도
+        # max height/width 는 그대로다 (실제로 그 버그가 있었다). IoU 로 본다.
         one = raw_obs["mask1"][:12]
         rt = np.array([SurfaceCalculator._blend_blobs(m[None], [1.0]) for m in one])
         assert np.array_equal(_mask_extents(rt), _mask_extents(one)), \
             "blob 프로파일 라운드트립이 측정치를 바꿈"
-        print("[blob] 단일 blob 프로파일 라운드트립 12/12 측정치 보존")
+        ious = np.array([(a & b).sum() / max((a | b).sum(), 1)
+                         for a, b in zip(one, rt)])
+        assert ious.min() > 0.97, f"blob 형상이 보존되지 않음 — IoU 최소 {ious.min():.3f}"
+        print(f"[blob] 단일 blob 라운드트립 12/12 — 측정치 보존 + "
+              f"형상 IoU 평균 {ious.mean():.3f} 최소 {ious.min():.3f}")
+
+        # 떨어져 나온 이상치 픽셀은 연결성으로 걸러야 한다
+        spk = one[0].copy()
+        _srng = np.random.default_rng(3)
+        for _ in range(40):
+            spk[_srng.integers(0, spk.shape[0]), _srng.integers(0, spk.shape[1])] = True
+        kept = SurfaceCalculator._blend_blobs(spk[None], [1.0])
+        iou_spk = (one[0] & kept).sum() / max((one[0] | kept).sum(), 1)
+        assert iou_spk > 0.95, f"speckle 40개에 형상이 흔들림 — IoU {iou_spk:.3f}"
+        print(f"[blob] speckle 40개 주입에도 형상 유지 — IoU {iou_spk:.3f}")
 
         # ── blob 보간 점검 ②: 실측 마스크에 경계 노이즈가 있어도 섞으면 복원되나
         # (벤치마크 자체에는 flip 노이즈가 없으므로 여기서 직접 만들어 넣는다 —

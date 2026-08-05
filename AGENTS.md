@@ -57,6 +57,7 @@ assert set(OPTIMIZERS) == EXPECTED   # 하나라도 빠지면 불합격
 | `optimizer.py` | 알고리즘 + score 파이프라인 + 셸 | 실행 루프, 플로팅 |
 | `runner.py` | ask→평가→tell 반복 기계 | 점수 계산, 비교, 시각화 |
 | `make_dataset.py` | 관측 설계 + 측정 → obs.jsonl | 알고리즘·점수 개념 |
+| `accept.py` | 완료조건 판정 (참값 대조) | production 로직 |
 
 기계 검수:
 1. 5개 파일 전부 존재 + 각 파일의 진입점(`python <file>` 자가 점검/CLI)이
