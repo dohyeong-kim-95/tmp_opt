@@ -54,9 +54,8 @@ from space import SearchSpace
 
 _SPACE = SearchSpace()  # 기본 30컬럼 문제 기하 (signed 범위)
 
-# 목적 이름 / 최적화 방향 (+1 = 최대화, -1 = 최소화)
-OBJECTIVE_NAMES: tuple[str, ...] = ("y11", "y12", "y13", "y21", "y22", "y23")
-OBJECTIVE_SENSES: tuple[int, ...] = (+1, +1, -1, +1, +1, -1)
+# 목적 이름 / 방향은 algo.py 가 표준 (측정·점수 정의와 같은 곳에 둔다)
+from algo import OBJECTIVE_NAMES, OBJECTIVE_SENSES  # noqa: E402
 
 # 블록별 컬럼 인덱스 (표준 명세에서 유도 — 하드코딩 금지)
 _COMMON_COLS = _SPACE.block_cols("common")
@@ -792,54 +791,18 @@ class SurfaceCalculator:
                                     np.percentile(e, 90, axis=0).round(4)))}
 
 
-def serve_eval(surface_data, exchange_dir, seed: int) -> int:
-    """프로세스 분리 실행의 calculator 한 스텝: x.txt 읽기 → 평가 → y_raw.bin.
-
-    surface_data(obs.jsonl 경로)로 실측 반응표면을 만들어 평가한다. 교환 셸 함수
-    (read_x/write_y_raw)는 optimizer 소유라 여기서 지연 import 한다 (모듈 순환
-    회피).
-
-    표면은 프로세스마다 새로 로드되므로 커버리지 판정은 교환 디렉토리의
-    `coverage.jsonl` 에 append 로 남긴다 — 스텝 간 기억이 파일뿐인 것은
-    optimizer 쪽과 같은 제약이다.
-
-    노이즈는 (seed, eval_index) 로 재시딩해 프로세스 경계와 무관하게 결정적이다
-    (표면 기본값 noise_level=0 이면 애초에 무관하다).
-    """
-    import json
-    from pathlib import Path
-
-    from optimizer import read_x, write_y_raw
-
-    d = Path(exchange_dir)
-    X, eval_index = read_x(d / "x.txt", space=SearchSpace())
-    calc = SurfaceCalculator.from_jsonl(surface_data, noise_seed=seed)
-    calc._noise_rng = np.random.default_rng([seed, eval_index])
-    raw = calc.evaluate(X)  # 구조화 관측 원형
-    write_y_raw(d / "y_raw.bin", raw, eval_index=eval_index)
-    with (d / "coverage.jsonl").open("a") as fh:  # 커버리지 이력은 파일에만 남는다
-        for rec in calc.coverage_log:
-            rec["eval"] += eval_index  # 프로세스 로컬 카운터 → 전역 인덱스
-            fh.write(json.dumps(rec) + "\n")
-    return len(X)
-
-
 if __name__ == "__main__":
     import argparse
 
-    _ap = argparse.ArgumentParser(description="calculator — 자가 점검 또는 프로세스 분리 평가")
-    _ap.add_argument("--serve-eval", action="store_true",
-                     help="파일 기반 프로세스 분리 실행의 calculator 한 스텝")
-    _ap.add_argument("--dir", type=str, default=None, help="교환 디렉토리")
-    _ap.add_argument("--seed", type=int, default=0)
+    _ap = argparse.ArgumentParser(description="calculator — 반응표면 자가 점검")
     _ap.add_argument("--surface-selfcheck", action="store_true",
                      help="SurfaceCalculator(모킹 반응표면) 자가 점검")
-    _ap.add_argument("--surface-data", type=str, default=None, metavar="JSONL",
-                     help="실측 관측 obs.jsonl — --serve-eval 에 필수")
     _args = _ap.parse_args()
 
     if _args.surface_selfcheck:
-        from optimizer import _mask_extents, convert_y_raw
+        from algo import convert_y_raw
+        _mask_extents = lambda m: (m.sum(axis=1).max(axis=1),
+                                   m.sum(axis=2).max(axis=1))
 
         class _FakeInstrument:
             """자가 점검 전용 가짜 측정 장치 — '비싼 TEST' 의 대역.
@@ -1063,13 +1026,6 @@ if __name__ == "__main__":
         print(f"[LOO]    {surf.loo_report()}")
         raise SystemExit(0)
 
-    if _args.serve_eval:  # runner 가 서브프로세스로 호출하는 경로
-        assert _args.dir, "--serve-eval 에는 --dir 필요"
-        assert _args.surface_data, "--serve-eval 에는 --surface-data 필요"
-        b = serve_eval(_args.surface_data, _args.dir, _args.seed)
-        print(f"[calc-eval] {_args.surface_data} → {b} evals → y_raw.bin")
-        raise SystemExit(0)
-
     # 인자 없음 → 공간 명세만 확인하고 사용법 안내
     space = SearchSpace()
     print(f"search space log10 size = {space.log10_size:.2f}  "
@@ -1077,5 +1033,4 @@ if __name__ == "__main__":
     print(f"목적 {OBJECTIVE_NAMES} / sense {OBJECTIVE_SENSES}")
     print("이 모듈의 calculator 는 SurfaceCalculator (실측 반응표면) 하나다.")
     print("  자가 점검 : python calculator.py --surface-selfcheck")
-    print("  분리 평가 : python calculator.py --serve-eval "
-          "--surface-data obs.jsonl --dir xchg/")
+    print("  구동      : python run.py --algo xgb_tr --obs obs.jsonl --budget 800")

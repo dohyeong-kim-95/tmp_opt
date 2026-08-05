@@ -12,14 +12,14 @@
         (게이트를 무시하고 억지로 보간했다면 실제로 크게 틀렸어야 한다)
 
   (3) 최적화 알고리즘과 roundtrip 이 되는가
-      → in-process 전 optimizer 완주 + 프로세스 분리 파일 교환 + 체크포인트 재개
+      → 전 알고리즘이 예산을 완주하고 obs.jsonl 이 그만큼 자라는가 + 중단·재개
 
   (4) 샘플이 추가되면 즉시 반영되는가
       → no_data 이던 X 를 측정해 append → 재로드 시 exact 로 바뀌고 값이 일치
 
 실행:
-    python accept.py                 # 전체 (프로세스 분리 포함, 수십 초)
-    python accept.py --quick         # 프로세스 분리/전 optimizer 생략
+    python accept.py                 # 전체 (중단·재개 포함, 수십 초)
+    python accept.py --quick         # 중단·재개 검사 생략
 """
 
 from __future__ import annotations
@@ -30,11 +30,10 @@ from pathlib import Path
 
 import numpy as np
 
-from calculator import (OBJECTIVE_NAMES, SurfaceCalculator,
-                        load_observations, save_observations)
+from algo import ALGORITHMS, OBJECTIVE_NAMES, convert_y_raw
+from calculator import (SurfaceCalculator, load_observations, save_observations)
 from make_dataset import SimulatedInstrument, build_dataset
-from optimizer import OPTIMIZERS, convert_y_raw, load_history
-from runner import run_single, run_separated
+from run import run
 from space import SearchSpace
 
 _HERE = Path(__file__).resolve().parent
@@ -153,43 +152,37 @@ def criterion_2(surf, inst, obs_X, space, rng, n=200) -> bool:
 def criterion_3(obs_path, quick: bool) -> bool:
     """최적화 알고리즘과 roundtrip 이 되는가."""
     print("\n[3] 최적화 알고리즘과 roundtrip")
-    names = list(OPTIMIZERS) if not quick else ["random", "sa", "xgb_tr"]
-    done = []
-    for name in names:
-        s = SurfaceCalculator.from_jsonl(obs_path, policy="pessimistic")
-        r = run_single(name, s, seed=0, budget=60, source=str(obs_path))
-        assert len(r.X) == 60 and r.Y_raw.shape == (60, 6)
-        done.append(name)
-    print(f"    in-process 완주 {len(done)}/{len(names)}")
-
-    ok_sep = True
-    if not quick:
+    ok = True
+    for name in sorted(ALGORITHMS):
         with tempfile.TemporaryDirectory() as td:
-            d = Path(td)
-            r = run_separated("ga", obs_path, seed=0, budget=20,
-                              exchange_dir=d, verbose=False)
-            files = {f.name for f in d.iterdir()}
-            need = {"x.txt", "y_raw.bin", "history.jsonl", "state.pkl",
-                    "done", "coverage.jsonl"}
-            missing = need - files
-            X, Y = load_history(d / "history.jsonl", space=SearchSpace())
-            cov = sum(1 for _ in (d / "coverage.jsonl").open())
-            ok_sep = not missing and len(X) == 20 and cov == 20
-            print(f"    프로세스 분리: 교환파일 {sorted(files)}")
-            print(f"      history {len(X)}행, coverage.jsonl {cov}줄"
-                  + (f", 누락 {missing}" if missing else ""))
+            work = Path(td) / "obs.jsonl"
+            work.write_text(Path(obs_path).read_text())
+            n0 = sum(1 for _ in work.open())
+            calc = SurfaceCalculator.from_jsonl(work, policy="pessimistic")
+            r = run(name, calc, work, budget=60, seed=0, verbose=False)
+            n1 = sum(1 for _ in work.open())
+            grew = (n1 - n0) == 60
+            print(f"    {name:<10} {r['n_evals']} evals, best={r['best_score']:.4f}, "
+                  f"obs.jsonl {n0}→{n1}행 {'OK' if grew else 'FAIL'}")
+            ok &= r["n_evals"] == 60 and grew
 
-        # 체크포인트 재개 = 무중단과 동일 궤적
+    if not quick:  # 중단 → 재개가 이어서 도는가 (관측 파일 + state.pkl)
         with tempfile.TemporaryDirectory() as td:
-            ck = Path(td) / "ck"
-            s = SurfaceCalculator.from_jsonl(obs_path)
-            a = run_single("sa", s, seed=0, budget=40, checkpoint_dir=ck)
-            Xc, Yc = load_history(ck / "history.jsonl", space=SearchSpace())
-            same = np.array_equal(Xc, a.X)
-            print(f"    체크포인트 history 왕복 일치: {same}")
-            ok_sep &= bool(same)
+            work = Path(td) / "obs.jsonl"
+            work.write_text(Path(obs_path).read_text())
+            n0 = sum(1 for _ in work.open())
+            calc = SurfaceCalculator.from_jsonl(work, policy="pessimistic")
+            run("xgb_tr", calc, work, budget=40, seed=0, verbose=False)
+            mid = sum(1 for _ in work.open())
+            calc2 = SurfaceCalculator.from_jsonl(work, policy="pessimistic")
+            r2 = run("xgb_tr", calc2, work, budget=80, seed=0, resume=True,
+                     verbose=False)
+            end = sum(1 for _ in work.open())
+            res_ok = (mid - n0) == 40 and (end - n0) == 80
+            print(f"    재개: {n0}→{mid}행(40 evals) → 이어서 {end}행(총 80) "
+                  f"{'OK' if res_ok else 'FAIL'}")
+            ok &= res_ok
 
-    ok = len(done) == len(names) and ok_sep
     print(f"    → {'PASS' if ok else 'FAIL'}")
     return bool(ok)
 
@@ -250,8 +243,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="시뮬레이션 환경 완료조건 검사")
     ap.add_argument("--obs", type=Path, default=_HERE / "obs.jsonl",
                     help="관측 파일 (없으면 즉석 생성)")
-    ap.add_argument("--quick", action="store_true",
-                    help="프로세스 분리·전 optimizer 검사 생략")
+    ap.add_argument("--quick", action="store_true", help="중단·재개 검사 생략")
     ap.add_argument("--instrument-seed", type=int, default=303)
     args = ap.parse_args()
 

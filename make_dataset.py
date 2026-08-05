@@ -40,8 +40,8 @@ from pathlib import Path
 
 import numpy as np
 
-from calculator import (OBJECTIVE_NAMES, _GROUP1_COLS, _GROUP2_COLS,
-                        save_observations)
+from algo import OBJECTIVE_NAMES
+from calculator import _GROUP1_COLS, _GROUP2_COLS, save_observations
 from space import SearchSpace
 
 #: 관측 마스크 격자 (calculator.SurfaceCalculator.RASTER_GRID 와 같아야 한다)
@@ -204,7 +204,7 @@ def build_dataset(instrument, space: SearchSpace, n_random: int = 60,
     X = np.vstack([blocks[k] for k in ("one_hot", "random", "repeat")])
     raw = instrument.evaluate(X)          # 노이즈 포함 = 실측 대역
 
-    from optimizer import convert_y_raw   # 측정 정의는 optimizer 소유
+    from algo import convert_y_raw   # 측정 정의는 algo.py 소유
     Y = convert_y_raw(raw)
     # 블록 라벨 — 어느 설계에서 나온 점인지 나중에 되짚을 수 있게
     labels = np.concatenate([[k] * len(blocks[k])
