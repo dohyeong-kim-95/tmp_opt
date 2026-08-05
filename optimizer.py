@@ -438,7 +438,7 @@ def serve_step(optimizer_name: str, exchange_dir: str | Path,
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 공유 score 파이프라인 — raw y0 → 정규화 z → 스칼라 점수
-# 탐색 구동(OptimizerBase.tell)과 리포트(benchmark.py 의 pooled 재점수)가
+# 탐색 구동(OptimizerBase.tell)과 사후 리포트가
 # 같은 구현을 공유해야 랭킹이 유효하다. sense(max/min 방향) 적용은 시스템
 # 전체에서 RobustScaler.transform 한 곳뿐이다.
 # ──────────────────────────────────────────────────────────────────────────────

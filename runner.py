@@ -6,13 +6,16 @@
     3. state = opt.tell(state, batch, Y_raw_batch)   # 증분 raw 관측 통보
 
 역할 분담:
-    - calculator.py : X → raw y0 계산 (문제 정의·노이즈)
+    - calculator.py : X → raw y0 계산 (문제 정의 = 실측 반응표면)
     - optimizer.py  : 나머지 전부 — 히스토리 누적, 스케일링/sense 통일,
                       scalarization, 알고리즘. runner 는 점수를 전혀 모른다.
-    - benchmark.py  : 여러 run 의 비교 — pooled 재점수, 토너먼트/격자, 시각화.
 
 실행 예:
-    python runner.py --optimizer sa --benchmark bm1_easy --seed 0 --budget 800
+    python runner.py --optimizer sa --surface-data obs.npz --seed 0 --budget 800
+
+calculator 는 이름으로 조회하지 않고 **인스턴스를 직접 받는다** — 합성 벤치마크
+레지스트리(BENCHMARKS)를 걷어내면서 그 간접층이 필요 없어졌다. 계약은
+`evaluate(X) -> y_raw dict` 하나뿐이라 다른 측정기를 물려도 그대로 동작한다.
 """
 
 from __future__ import annotations
@@ -26,7 +29,7 @@ from pathlib import Path
 
 import numpy as np
 
-from calculator import BENCHMARKS
+from calculator import SurfaceCalculator
 from optimizer import (OPTIMIZERS, OptimizerBase, SCORERS, append_history,
                        load_history, save_state)
 from space import SearchSpace
@@ -36,10 +39,10 @@ _HERE = Path(__file__).resolve().parent
 
 @dataclass
 class RunResult:
-    """한 번의 (optimizer × benchmark × seed) 실행 결과."""
+    """한 번의 (optimizer × calculator × seed) 실행 결과."""
 
     optimizer: str
-    benchmark: str
+    source: str          # 관측 출처 라벨 (보통 npz 경로)
     seed: int
     X: np.ndarray        # (N, 30) 평가된 해들 (평가 순서대로)
     Y_raw: np.ndarray    # (N, 6)  raw 관측값 (노이즈 포함)
@@ -49,22 +52,24 @@ class RunResult:
 
 def run_single(
     optimizer_name: str,
-    benchmark_name: str,
+    calc,
     seed: int,
     budget: int,
     scorer_name: str = "chebyshev",
     checkpoint_dir: Path | None = None,
+    source: str = "surface",
 ) -> RunResult:
-    """optimizer 하나를 벤치마크 하나에서 budget 회 평가할 때까지 실행한다.
+    """optimizer 하나를 calculator 하나에서 budget 회 평가할 때까지 실행한다.
 
     Args:
+        calc          : `evaluate(X) -> y_raw dict` 를 만족하는 계산기 인스턴스.
+        source        : 결과에 남길 관측 출처 라벨 (보통 npz 경로).
         scorer_name   : optimizer 내부 score 파이프라인의 scalarization 선택.
         checkpoint_dir: 지정하면 매 tell 후 history.jsonl(관측 append-only) +
                         state.pkl(알고리즘 상태)을 기록한다. 이 두 파일로
                         optimizer.load_state 재개가 가능하다.
     """
     space = SearchSpace()
-    calc = BENCHMARKS[benchmark_name](noise_seed=seed)
     opt: OptimizerBase = OPTIMIZERS[optimizer_name](
         space, total_budget=budget, scorer_name=scorer_name
     )
@@ -100,7 +105,7 @@ def run_single(
     assert state["n_evals"] == budget  # 히스토리 무결성 (optimizer 소유)
     return RunResult(
         optimizer=optimizer_name,
-        benchmark=benchmark_name,
+        source=source,
         seed=seed,
         X=state["X_hist"].copy(),
         Y_raw=state["Y_raw_hist"].copy(),
@@ -111,7 +116,7 @@ def run_single(
 
 def run_separated(
     optimizer_name: str,
-    benchmark_name: str,
+    surface_data: str | Path,
     seed: int,
     budget: int,
     exchange_dir: Path,
@@ -129,14 +134,16 @@ def run_separated(
     """
     d = Path(exchange_dir)
     d.mkdir(parents=True, exist_ok=True)
-    for f in ("state.pkl", "history.jsonl", "x.txt", "y_raw.bin", "done"):
+    for f in ("state.pkl", "history.jsonl", "x.txt", "y_raw.bin", "done",
+              "coverage.jsonl"):
         (d / f).unlink(missing_ok=True)
 
     opt_cmd = [sys.executable, str(_HERE / "optimizer.py"), "--serve-step",
                "--optimizer", optimizer_name, "--dir", str(d),
                "--seed", str(seed), "--budget", str(budget)]
     calc_cmd = [sys.executable, str(_HERE / "calculator.py"), "--serve-eval",
-                "--benchmark", benchmark_name, "--dir", str(d), "--seed", str(seed)]
+                "--surface-data", str(surface_data), "--dir", str(d),
+                "--seed", str(seed)]
 
     t0 = time.perf_counter()
     rounds = 0
@@ -155,19 +162,20 @@ def run_separated(
     X, Y = load_history(d / "history.jsonl", space=SearchSpace())
     assert len(X) == budget, f"history 길이 {len(X)} ≠ 예산 {budget}"
     if verbose:
-        print(f"[separated] {optimizer_name} on {benchmark_name}: "
+        print(f"[separated] {optimizer_name} on {surface_data}: "
               f"{rounds} handshake 라운드, {len(X)} evals, "
               f"{time.perf_counter() - t0:.1f}s")
-    return RunResult(optimizer_name, benchmark_name, seed, X, Y,
+    return RunResult(optimizer_name, str(surface_data), seed, X, Y,
                      time.perf_counter() - t0)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="단일 run 실행기 (여러 run 비교/시각화는 benchmark.py)"
+        description="단일 run 실행기 — 반응표면 위에서 optimizer 하나를 구동"
     )
     parser.add_argument("--optimizer", choices=list(OPTIMIZERS), default="random")
-    parser.add_argument("--benchmark", choices=list(BENCHMARKS), default="bm1_easy")
+    parser.add_argument("--surface-data", type=Path, required=True, metavar="NPZ",
+                        help="실측 관측 npz (키: X, Y [, mask1, mask2])")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--budget", type=int, default=800,
                         help="run 당 평가 횟수 (기본 800)")
@@ -181,19 +189,27 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.separate is not None:  # 파일 기반 프로세스 분리 실행
-        r = run_separated(args.optimizer, args.benchmark, args.seed,
+        r = run_separated(args.optimizer, args.surface_data, args.seed,
                           args.budget, args.separate)
-        print(f"{r.optimizer} on {r.benchmark} seed={r.seed}: "
+        print(f"{r.optimizer} on {r.source} seed={r.seed}: "
               f"{len(r.X)} evals via 파일 교환 ({args.separate})")
         return
 
-    r = run_single(args.optimizer, args.benchmark, args.seed, args.budget,
-                   args.scorer, args.checkpoint_dir)
+    calc = SurfaceCalculator.from_npz(args.surface_data, noise_seed=args.seed)
+    r = run_single(args.optimizer, calc, args.seed, args.budget,
+                   args.scorer, args.checkpoint_dir, source=str(args.surface_data))
     drive_best = float(r.final_state["scores_hist"].max())
-    print(f"{r.optimizer} on {r.benchmark} seed={r.seed}: "
+    print(f"{r.optimizer} on {r.source} seed={r.seed}: "
           f"{len(r.X)} evals, {r.elapsed_sec:.1f}s, "
-          f"drive best={drive_best:.4f} "
-          f"(per-run 스케일러 기준 — run 간 비교는 benchmark.py 의 pooled 점수로)")
+          f"drive best={drive_best:.4f} (per-run 스케일러 기준)")
+    rep = calc.report()
+    print(f"  커버리지: no_data {rep['no_data_rate']:.1%} / "
+          f"exact {rep['exact_rate']:.1%} · "
+          f"관측까지 해밍거리 중앙값 {rep['d_hamming']['median']:.3f} "
+          f"(최소 {rep['d_hamming']['min']:.3f}, 게이트 {rep['d_gate']:.3f})")
+    if rep["no_data_rate"] > 0.5:
+        print("  ⚠ 제안의 절반 이상이 관측 커버리지 밖 — 이 run 의 y 는 "
+              "대부분 근거가 없다 (관측을 늘리거나 탐색 범위를 좁힐 것)")
 
 
 if __name__ == "__main__":

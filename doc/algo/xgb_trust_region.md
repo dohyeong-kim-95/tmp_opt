@@ -1,15 +1,18 @@
 # XGB Trust-Region (`xgb_tr`) — CASMOPOLITAN-lite
 
-`optimizer.py` 의 `XGBTrustRegionOptimizer` 전용 문서. 현재 이 리포지토리의
-챔피언 optimizer 로, 토너먼트 3단계(easy/medium/hard)와 난이도 요인 격자
-(bm3/bm4/bm5) **전부에서 1위**를 기록했다.
+`optimizer.py` 의 `XGBTrustRegionOptimizer` 전용 문서. 이 리포지토리의 챔피언
+optimizer 로, 과거 합성 벤치마크 5종 **전부에서 1위**를 기록했다.
+
+> 그 벤치마크(bm1~bm5)는 실측 기반 반응표면으로 방향을 틀면서 제거했다.
+> 아래에 남은 bm* 언급은 **당시 측정의 출처 표기**이고, 숫자와 해석은
+> [`lesson_learned.md`](../../lesson_learned.md) 에 정리돼 있다.
 
 ---
 
 ## 1. 왜 만들었나 — 전신(xgb_surrogate)의 실측 약점
 
-`xgb_surrogate` (XGB 회귀 + 전역 후보 풀 + novelty 보너스)는 bm3_hard 에서
-평균 1위였지만 **init seed 에 따른 분산이 치명적**이었다:
+`xgb_surrogate` (XGB 회귀 + 전역 후보 풀 + novelty 보너스)는 당시 최난도
+벤치마크(bm3_hard)에서 평균 1위였지만 **init seed 에 따른 분산이 치명적**이었다:
 
 - bm3_hard 10 seeds: 0.696 ± **0.102** (동시기 aco ± 0.050)
 - top-3 confirmation: **0.702 / 0.511 / 0.260** — init 이 나쁘면 반토막 이하
@@ -112,22 +115,18 @@ acquisition(x) = mean_i μ_i(x) + κ · std_i μ_i(x)
 8→4→2→1 로 붕괴해 restart 까지 ~32 batch(128 evals) — 한 run 에서 3~5개
 trajectory 를 시도할 수 있는 배분이다.
 
-## 6. 실측 성적 (이 리포지토리)
+## 6. 실측 성적
 
-| 실험 | 결과 |
-|---|---|
-| xgb_surrogate 와 1:1 (bm3_hard, 5 seeds, 동일 pooled scaler) | mean 0.619 vs 0.556, std **0.050 vs 0.093**, 최악 seed **0.573 vs 0.474** |
-| 토너먼트 (11종) | 3단계 전부 1위 → 챔피언 |
-| top-3 confirmation | 0.768 / 0.750 / 0.491 (전신: 0.702 / 0.511 / 0.260) |
-| 요인 격자 (bm3 복합 / bm4 기만 / bm5 상호작용, 5 seeds) | **전부 1위**: 0.804±0.058 / 0.781±0.039 / 0.747±0.080 |
+이 설계를 뽑은 근거는 합성 벤치마크(bm1~bm5) 토너먼트였다. 그 벤치마크는
+실측 기반 반응표면으로 방향을 틀면서 제거했고, 숫자와 해석은
+[`lesson_learned.md`](../../lesson_learned.md) 로 옮겼다 (요약: 5벤치 전부 1위,
+전신 `xgb_surrogate` 대비 평균보다 **분산과 최악 seed** 가 크게 개선).
 
-요인 격자에서 전천후인 이유 — 세 난이도 요인 각각에 대응하는 부품이 있다:
+요인별로 대응하는 부품이 있어 전천후였다:
 
-- 교차-블록 **상호작용** → 전역 XGB 모델이 학습 (bm5)
-- **기만**(trap 골짜기) → 후보의 30% 랜덤 레벨 점프 + restart 가 골짜기를
-  건너뜀 (bm4)
+- 교차-블록 **상호작용** → 전역 XGB 모델이 학습
+- **기만**(trap 골짜기) → 후보의 30% 랜덤 레벨 점프 + restart 가 골짜기를 건넘
 - **rugged/노이즈** → 앙상블 σ 가 험한 곳을 식별, TR 이 검증된 지역에 집중
-  (bm3)
 
 ## 7. 한계와 개선 여지
 
@@ -154,5 +153,5 @@ trajectory 를 시도할 수 있는 배분이다.
   Bayesian Optimization* (TuRBO). NeurIPS. — trust region BO 의 원형.
 - M. Lindauer et al. (2022). *SMAC3.* JMLR. https://arxiv.org/abs/2109.09831
   — tree 계열 surrogate + 앙상블 불확실성 노선.
-- 관련 문서: `doc/algo/research_better_algorithms.md` (선정 배경),
+- 관련 문서: [`lesson_learned.md`](../../lesson_learned.md) (선정 배경과 실측),
   `doc/algo/chow_liu_eda.md` (대조군 — 생성 모델 접근의 실패 사례).
