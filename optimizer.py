@@ -508,6 +508,32 @@ SCORERS = {
 }
 
 
+def get_scores(Y_raw: np.ndarray, kind: str = "chebyshev",
+               scaler: "RobustScaler | None" = None, **scorer_kw) -> np.ndarray:
+    """raw 관측 (n, 6) → 점수 (n,). **점수 파이프라인의 단일 진입점.**
+
+    정규화(robust p5–p95) → sense 통일(최소화 목적 뒤집기) → scalarization 을
+    한 번에 한다. `OptimizerBase.tell` 도, 밖에서 직접 도는 루프도, 사후 분석도
+    전부 이 함수를 지나야 한다 — 구현이 두 벌이 되는 순간 알고리즘 간 비교가
+    조용히 무의미해진다 (실행은 안 깨지므로 아무도 눈치채지 못한다).
+
+    Args:
+        Y_raw     : (n, 6) 열 순서 = OBJECTIVE_NAMES
+        kind      : SCORERS 키 ("chebyshev" 기본 / "sum" / "owa")
+        scaler    : 이미 적합된 RobustScaler. None 이면 Y_raw 로 새로 적합한다
+                    (= 전체 히스토리 재적합. 기본 동작)
+        scorer_kw : scalarization 파라미터 (chebyshev 의 rho, owa 의 k 등)
+
+    사용 예 (OptimizerBase 없이 직접 루프를 도는 경우):
+        Y = convert_y_raw(calc.evaluate(X))
+        scores = get_scores(Y)            # 알고리즘에 넘길 [0,1] 점수
+    """
+    if kind not in SCORERS:
+        raise ValueError(f"알 수 없는 scorer {kind!r} — 사용 가능: {sorted(SCORERS)}")
+    sc = RobustScaler().fit(Y_raw) if scaler is None else scaler
+    return SCORERS[kind](sc.transform(Y_raw), **scorer_kw)
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # 베이스 클래스
 # ──────────────────────────────────────────────────────────────────────────────
@@ -607,15 +633,18 @@ class OptimizerBase:
         # 값 범위를 모르므로 기본은 매 tell 전체 재적합·재점수 — 과거 관측의
         # 점수도 매번 바뀐다 (알고리즘은 인덱스로 기억하고 최신 점수 재조회).
         state["_since_refit"] += b
+        # 점수는 get_scores 한 곳에서만 만들어진다 (밖에서 직접 루프를 돌 때도
+        # 같은 함수를 쓰면 결과가 정확히 일치한다 — 구현이 갈라질 여지가 없다)
         scaler = RobustScaler()
         if state["_lo"] is None or state["_since_refit"] >= self.rescore_interval:
             scaler.fit(state["_Y_buf"][:n])
             state["_lo"], state["_hi"] = scaler.lo, scaler.hi
-            state["_s_buf"][:n] = self.scorer(scaler.transform(state["_Y_buf"][:n]))
+            state["_s_buf"][:n] = get_scores(state["_Y_buf"][:n], self.scorer_name,
+                                             scaler=scaler)
             state["_since_refit"] = 0
         else:  # 장기 실행 경로: 새 관측만 기존 스케일러로 점수화
             scaler.lo, scaler.hi = state["_lo"], state["_hi"]
-            state["_s_buf"][n0:n] = self.scorer(scaler.transform(Y_new))
+            state["_s_buf"][n0:n] = get_scores(Y_new, self.scorer_name, scaler=scaler)
 
         self._sync_views(state)
         return self._update(state, state["X_hist"], state["scores_hist"])

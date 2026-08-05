@@ -63,9 +63,21 @@ state = opt.tell(state, x, y)   # "이렇게 나왔다"
 
 목적이 6개고 은닉 스케일이 5~6자릿수 차이 난다. 그래서 정규화(robust p5–p95) →
 sense 통일(최소화 목적 뒤집기) → scalarization(chebyshev 기본) 이 필요한데,
-이건 `tell` 이 이미 해서 `scores` 로 준다. 알고리즘마다 다시 구현하면 **알고리즘
-간 비교가 성립하지 않는다.** 원시값이 꼭 필요하면 `Y` 를 쓰되, 순위 판단은
-`scores` 로 하라.
+이건 이미 되어서 `scores` 로 온다. 알고리즘마다 다시 구현하면 **알고리즘 간
+비교가 조용히 무의미해진다** (실행이 깨지지 않으니 아무도 눈치채지 못한다).
+원시값이 꼭 필요하면 `Y` 를 쓰되, 순위 판단은 `scores` 로 하라.
+
+점수 파이프라인의 단일 진입점은 `get_scores` 다. `OptimizerBase.tell` 도 이걸
+쓰므로, 밖에서 직접 루프를 돌 때 같은 함수를 부르면 결과가 **정확히 일치**한다
+(3개 scorer 전부 오차 0으로 검증):
+
+```python
+from optimizer import convert_y_raw, get_scores
+
+Y = convert_y_raw(calc.evaluate(X))
+scores = get_scores(Y)                       # 기본 chebyshev
+scores = get_scores(Y, "owa", k=3)           # scalarization·파라미터 변경
+```
 
 ## 3. 규칙 세 개
 
@@ -129,7 +141,22 @@ import 된다. 플러그인을 로드하지 않으면 `OPTIMIZERS` 는 기존 11
 python algo_template.py
 ```
 
-## 7. 클래스로 쓰고 싶다면
+## 7. OptimizerBase 없이 직접 루프를 돌아도 되나
+
+된다. `OptimizerBase` 는 네 가지를 대신해 줄 뿐이고, 앞의 셋은 직접 해도 된다:
+
+| 하는 일 | 직접 하면 |
+|---|---|
+| 마스크 → 숫자 6개 | `convert_y_raw(raw)` 를 부르면 끝 |
+| 숫자 → 점수 | `get_scores(Y)` 를 부르면 끝 (재구현 금지) |
+| 히스토리 누적 | `np.vstack` 몇 줄 (매번 O(N) 복사라는 점만 유의) |
+| **체크포인트 호환 state** | ← 이건 `OptimizerBase` 가 필요하다 |
+
+즉 **한 알고리즘을 한 번 굴려보는 실험**이면 `OptimizerBase` 없이 100줄이면
+충분하다. 필요해지는 시점은 두 가지다: 중단·재개(또는 프로세스 분리)를 쓸 때,
+그리고 여러 알고리즘을 **같은 조건에서 비교**할 때.
+
+## 8. 클래스로 쓰고 싶다면
 
 기존 11종처럼 `OptimizerBase` 를 상속해도 된다 — 함수 스타일은 그 위에 얹은
 얇은 어댑터일 뿐이고 둘은 완전히 같은 계약을 만족한다. 상태 기계가 복잡하거나
