@@ -5,7 +5,7 @@ rerun.log
 matrix.log
 results/
 vis/
-obs.npz
+obs.jsonl
 *.npz
 xchg/
 ckpt/

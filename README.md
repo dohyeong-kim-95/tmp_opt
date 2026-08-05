@@ -16,7 +16,7 @@
 | `calculator.py` | 문제 정의 — **X → raw y_raw 계산기**. 실측 관측으로 세운 반응표면 `SurfaceCalculator` |
 | `optimizer.py` | **나머지 전부** — stateless optimizer 11종 + 히스토리 누적 + 온라인 스케일링/sense 통일/scalarization (공유 score 파이프라인) + 파일 교환 셸(x.txt/y_raw.bin) + 체크포인트(history.jsonl/state.pkl) |
 | `runner.py` | calculator ↔ optimizer 를 **반복 호출하는 기계** (ask → 순차 평가 → tell) |
-| `make_dataset.py` | **관측 데이터셋 생성** — one-hot 스크리닝 / 무작위 / 반복측정 설계 → `obs.npz` |
+| `make_dataset.py` | **관측 데이터셋 생성** — one-hot 스크리닝 / 무작위 / 반복측정 설계 → `obs.jsonl` |
 | `lesson_learned.md` | 합성 벤치마크 시대에서 건진 것 (설계·알고리즘·관측모델 교훈) |
 | `doc/algo/` | 알고리즘 소개 문서 (`xgb_tr`, Chow-Liu 트리 EDA) |
 
@@ -162,9 +162,23 @@ tell 로 재생(replay)해 상태를 재구성할 수 있다.
 ## 워크플로 — 데이터 만들기 → 반응표면 → 알고리즘 검증
 
 ```
-make_dataset.py  ──▶  obs.npz  ──▶  SurfaceCalculator  ──▶  runner.py
+make_dataset.py  ──▶  obs.jsonl  ──▶  SurfaceCalculator  ──▶  runner.py
   (설계 + 측정)        (관측)        (반응표면)             (알고리즘 구동)
 ```
+
+관측 파일은 **append-only jsonl 한 개**다. 한 줄이 관측 하나이고, 마스크
+원형까지 그 줄 안에 들어간다:
+
+```json
+{"i":0,"block":"one_hot","X":[...30개...],"Y":[...6개...],
+ "mask1":{"shape":[128,128],"runs":[[55,63,2],[56,62,5],...]},"mask2":{...}}
+```
+
+마스크는 행 단위 run-length(`[row, col0, len]`)다 — 무손실이고, blob 은 행마다
+연속 구간이 한두 개뿐이라 조밀하며(111점 242KB; base64 비트팩이면 634KB),
+무엇보다 눈으로 읽힌다. 관측이 이 프로젝트의 진실이므로 사람이 읽고 git 으로
+diff 할 수 있어야 한다는 요구가 형식을 정했다 — `history.jsonl` 과 같은 원리다.
+관측이 늘면 `--append` 로 이어쓴다 (전체 재작성 없음).
 
 ### 1. 관측 설계 (`make_dataset.py`)
 
@@ -240,15 +254,16 @@ surrogate 계열은 관측 영역으로 수렴하고, 분포/군집 계열은 �
 pip install numpy xgboost      # xgboost 는 xgb_surrogate / xgb_tr 에만 필요
 
 # 1) 관측 데이터셋 만들기
-python make_dataset.py --out obs.npz
-python make_dataset.py --out obs.npz --n-random 120 --n-repeat 30 --seed 1
+python make_dataset.py --out obs.jsonl
+python make_dataset.py --out obs.jsonl --n-random 120 --n-repeat 30 --seed 1
+python make_dataset.py --out obs.jsonl --append --n-random 40 --seed 1   # 관측 추가
 python make_dataset.py --selfcheck        # 설계·노이즈 요약 + 불변식 점검
 
 # 2) 알고리즘 구동
-python runner.py --optimizer sa --surface-data obs.npz --seed 0 --budget 800
-python runner.py --optimizer ga --surface-data obs.npz --checkpoint-dir ckpt/
+python runner.py --optimizer sa --surface-data obs.jsonl --seed 0 --budget 800
+python runner.py --optimizer ga --surface-data obs.jsonl --checkpoint-dir ckpt/
 #   → ckpt/history.jsonl + ckpt/state.pkl (optimizer.load_state 로 재개 가능)
-python runner.py --optimizer ga --surface-data obs.npz --budget 780 --separate xchg/
+python runner.py --optimizer ga --surface-data obs.jsonl --budget 780 --separate xchg/
 #   → 프로세스 분리: optimizer/calculator 를 별도 서브프로세스로 띄우고
 #     xchg/ 의 x.txt·y_raw.bin·history.jsonl·state.pkl 로만 통신 (in-process 우회 불가)
 #     커버리지 판정은 xchg/coverage.jsonl 에 append

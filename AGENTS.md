@@ -56,7 +56,7 @@ assert set(OPTIMIZERS) == EXPECTED   # 하나라도 빠지면 불합격
 | `calculator.py` | X → y_raw (문제 정의 = 실측 반응표면) | 점수·스케일링 개념 일체 |
 | `optimizer.py` | 알고리즘 + score 파이프라인 + 셸 | 실행 루프, 플로팅 |
 | `runner.py` | ask→평가→tell 반복 기계 | 점수 계산, 비교, 시각화 |
-| `make_dataset.py` | 관측 설계 + 측정 → obs.npz | 알고리즘·점수 개념 |
+| `make_dataset.py` | 관측 설계 + 측정 → obs.jsonl | 알고리즘·점수 개념 |
 
 기계 검수:
 1. 5개 파일 전부 존재 + 각 파일의 진입점(`python <file>` 자가 점검/CLI)이
@@ -64,7 +64,7 @@ assert set(OPTIMIZERS) == EXPECTED   # 하나라도 빠지면 불합격
 2. 공개 API 가 명세된 파일에 존재:
    `from space import SearchSpace` / `from calculator import SurfaceCalculator` /
    `from optimizer import OPTIMIZERS, RobustScaler, SCORERS` /
-   `from runner import run_single` / `python make_dataset.py --out obs.npz`
+   `from runner import run_single` / `python make_dataset.py --out obs.jsonl`
 3. 책임 경계 grep: runner 에 스케일링·scalarization 없음, calculator 에
    점수 개념 없음, optimizer 에 matplotlib 없음, make_dataset 에 알고리즘 없음
 4. 관측 데이터셋은 **make_dataset.py 진입점에서 생성된 것만 인정**

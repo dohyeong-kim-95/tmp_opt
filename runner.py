@@ -11,7 +11,7 @@
                       scalarization, 알고리즘. runner 는 점수를 전혀 모른다.
 
 실행 예:
-    python runner.py --optimizer sa --surface-data obs.npz --seed 0 --budget 800
+    python runner.py --optimizer sa --surface-data obs.jsonl --seed 0 --budget 800
 
 calculator 는 이름으로 조회하지 않고 **인스턴스를 직접 받는다** — 합성 벤치마크
 레지스트리(BENCHMARKS)를 걷어내면서 그 간접층이 필요 없어졌다. 계약은
@@ -42,7 +42,7 @@ class RunResult:
     """한 번의 (optimizer × calculator × seed) 실행 결과."""
 
     optimizer: str
-    source: str          # 관측 출처 라벨 (보통 npz 경로)
+    source: str          # 관측 출처 라벨 (보통 obs.jsonl 경로)
     seed: int
     X: np.ndarray        # (N, 30) 평가된 해들 (평가 순서대로)
     Y_raw: np.ndarray    # (N, 6)  raw 관측값 (노이즈 포함)
@@ -63,7 +63,7 @@ def run_single(
 
     Args:
         calc          : `evaluate(X) -> y_raw dict` 를 만족하는 계산기 인스턴스.
-        source        : 결과에 남길 관측 출처 라벨 (보통 npz 경로).
+        source        : 결과에 남길 관측 출처 라벨 (보통 obs.jsonl 경로).
         scorer_name   : optimizer 내부 score 파이프라인의 scalarization 선택.
         checkpoint_dir: 지정하면 매 tell 후 history.jsonl(관측 append-only) +
                         state.pkl(알고리즘 상태)을 기록한다. 이 두 파일로
@@ -174,8 +174,8 @@ def main() -> None:
         description="단일 run 실행기 — 반응표면 위에서 optimizer 하나를 구동"
     )
     parser.add_argument("--optimizer", choices=list(OPTIMIZERS), default="random")
-    parser.add_argument("--surface-data", type=Path, required=True, metavar="NPZ",
-                        help="실측 관측 npz (키: X, Y [, mask1, mask2])")
+    parser.add_argument("--surface-data", type=Path, required=True, metavar="JSONL",
+                        help="실측 관측 obs.jsonl (make_dataset.py 산출)")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--budget", type=int, default=800,
                         help="run 당 평가 횟수 (기본 800)")
@@ -195,7 +195,7 @@ def main() -> None:
               f"{len(r.X)} evals via 파일 교환 ({args.separate})")
         return
 
-    calc = SurfaceCalculator.from_npz(args.surface_data, noise_seed=args.seed)
+    calc = SurfaceCalculator.from_jsonl(args.surface_data, noise_seed=args.seed)
     r = run_single(args.optimizer, calc, args.seed, args.budget,
                    args.scorer, args.checkpoint_dir, source=str(args.surface_data))
     drive_best = float(r.final_state["scores_hist"].max())

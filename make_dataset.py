@@ -1,8 +1,9 @@
 """make_dataset.py — 반응표면의 재료가 될 관측 데이터셋을 만든다.
 
 실제 TEST 는 비싸다. 그래서 **무엇을 몇 점 측정할지**를 먼저 설계해 두고,
-그 설계대로 뽑은 (X, y_raw) 를 npz 로 남긴다. `calculator.SurfaceCalculator`
-가 이 npz 를 그대로 먹는다.
+그 설계대로 뽑은 (X, y_raw) 를 **obs.jsonl** 로 남긴다 (append-only 텍스트,
+마스크 원형까지 한 줄 안에 — 형식은 calculator.save_observations).
+`calculator.SurfaceCalculator.from_jsonl` 이 이걸 그대로 먹는다.
 
 설계 (세 블록) — 각각 다른 질문에 답한다:
 
@@ -22,13 +23,14 @@
      기본값은 전 컬럼 0 (signed 범위 [-(c//2), ...] 의 중앙 부근).
 
 관측 장치는 `SimulatedInstrument` — **다이아몬드에 가까운 blob** 을 낸다.
-실제 장치가 확보되면 이 클래스만 갈아끼우면 되고, 하류(npz 포맷 → 반응표면)는
+실제 장치가 확보되면 이 클래스만 갈아끼우면 되고, 하류(obs.jsonl → 반응표면)는
 그대로다.
 
 실행:
-    python make_dataset.py --out obs.npz
-    python make_dataset.py --out obs.npz --n-random 120 --n-repeat 30 --seed 1
-    python make_dataset.py --selfcheck        # 설계·노이즈 요약만 출력
+    python make_dataset.py --out obs.jsonl
+    python make_dataset.py --out obs.jsonl --n-random 120 --n-repeat 30 --seed 1
+    python make_dataset.py --out obs.jsonl --append   # 기존 관측에 이어쓰기
+    python make_dataset.py --selfcheck               # 설계·노이즈 요약만 출력
 """
 
 from __future__ import annotations
@@ -38,7 +40,8 @@ from pathlib import Path
 
 import numpy as np
 
-from calculator import OBJECTIVE_NAMES, _GROUP1_COLS, _GROUP2_COLS
+from calculator import (OBJECTIVE_NAMES, _GROUP1_COLS, _GROUP2_COLS,
+                        save_observations)
 from space import SearchSpace
 
 #: 관측 마스크 격자 (calculator.SurfaceCalculator.RASTER_GRID 와 같아야 한다)
@@ -191,7 +194,7 @@ def design_repeat(space: SearchSpace, n: int,
 def build_dataset(instrument, space: SearchSpace, n_random: int = 60,
                   n_repeat: int = 20, seed: int = 0,
                   default: np.ndarray | None = None) -> dict:
-    """세 블록을 붙여 측정하고 npz 페이로드를 만든다."""
+    """세 블록을 붙여 측정하고 저장용 페이로드를 만든다."""
     rng = np.random.default_rng(seed)
     blocks = {
         "one_hot": design_one_hot(space),
@@ -206,10 +209,8 @@ def build_dataset(instrument, space: SearchSpace, n_random: int = 60,
     # 블록 라벨 — 어느 설계에서 나온 점인지 나중에 되짚을 수 있게
     labels = np.concatenate([[k] * len(blocks[k])
                              for k in ("one_hot", "random", "repeat")])
-    return {"X": X, "Y": Y,
-            "mask1": raw["mask1"].astype(np.uint8),
-            "mask2": raw["mask2"].astype(np.uint8),
-            "block": labels, "n_repeat": np.int64(n_repeat)}
+    return {"X": X, "Y": Y, "block": labels,
+            "mask1": raw["mask1"], "mask2": raw["mask2"]}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -268,7 +269,9 @@ def print_summary(payload: dict) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser(description="반응표면용 관측 데이터셋 생성")
     ap.add_argument("--out", type=Path, default=None,
-                    help="저장할 npz 경로 (생략 시 저장 없이 요약만)")
+                    help="저장할 obs.jsonl 경로 (생략 시 저장 없이 요약만)")
+    ap.add_argument("--append", action="store_true",
+                    help="--out 파일에 이어쓴다 (관측을 늘릴 때)")
     ap.add_argument("--n-random", type=int, default=60, help="무작위 표본 수")
     ap.add_argument("--n-repeat", type=int, default=20,
                     help="기본값 반복측정 수 (노이즈 바닥 추정용)")
@@ -312,10 +315,17 @@ def main() -> None:
         return
 
     if args.out is not None:
-        np.savez_compressed(args.out, **payload)
-        mb = args.out.stat().st_size / 1e6
-        print(f"[저장] {args.out} ({mb:.1f} MB) — "
-              f"다음: python runner.py --optimizer sa --surface-data {args.out}")
+        save_observations(args.out, payload["X"], payload["Y"],
+                          block=payload["block"],
+                          masks={"mask1": payload["mask1"],
+                                 "mask2": payload["mask2"]},
+                          append=args.append)
+        n_lines = sum(1 for _ in args.out.open())
+        kb = args.out.stat().st_size / 1e3
+        print(f"[저장] {args.out} — {n_lines}줄 누적, {kb:.0f} KB"
+              f"{' (이어쓰기)' if args.append else ''}")
+        print(f"       다음: python runner.py --optimizer sa "
+              f"--surface-data {args.out}")
 
 
 if __name__ == "__main__":

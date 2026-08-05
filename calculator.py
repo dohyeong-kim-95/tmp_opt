@@ -32,7 +32,7 @@ Calculator 는 '한 번 평가에 비용이 드는 블랙박스 측정기'다. �
     * 값의 범위는 사전에 알 수 없다고 가정한다 (스케일러가 온라인으로 추정).
 
 사용 예:
-    calc = SurfaceCalculator.from_npz("obs.npz")   # 실측 (X, Y[, mask1, mask2])
+    calc = SurfaceCalculator.from_jsonl("obs.jsonl")   # 실측 관측
     y_raw = calc.evaluate(x)                        # 계약은 기존 calculator 와 동일
     print(calc.explain(x))                          # 근거 관측 + 커버리지 판정
     print(calc.report())                            # 알고리즘이 얼마나 벗어났나
@@ -89,6 +89,143 @@ _GROUP2_COLS = np.concatenate([_COMMON_COLS, _SET2_COLS])  # y21, y22, y23
 # 컬럼의 차이를 거리에 넣으면 근거 관측을 놓친다. 그 결과 커버리지 판정도
 # 목적 그룹별로 따로 난다 — y1x 는 데이터가 있고 y2x 는 없는 X 가 존재한다.
 # ──────────────────────────────────────────────────────────────────────────────
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 관측 데이터셋 파일 형식 — 반응표면의 입력 (obs.jsonl)
+#
+# **한 파일, append-only 텍스트.** 한 줄이 관측 하나이고, 마스크 원형까지
+# 그 줄 안에 들어간다. 관측은 이 프로젝트의 진실이므로 사람이 읽고 git 으로
+# diff 할 수 있어야 한다는 요구가 형식을 정한다 (history.jsonl 과 같은 원리).
+#
+#   {"i":0, "block":"one_hot", "X":[...30개...], "Y":[...6개...],
+#    "mask1":{"shape":[128,128],"runs":[[row,col0,len],...]}, "mask2":{...}}
+#
+# 마스크는 **행 단위 run-length** 로 넣는다. 무손실이고, blob 은 행마다 연속
+# 구간이 한두 개뿐이라 조밀하다 — 실측 111점 기준 base64(비트팩) 634KB 대비
+# RLE 235KB. 무엇보다 `[row, col0, len]` 은 눈으로 읽어도 의미가 보인다
+# (base64 는 한 줄 5.7KB 의 불투명한 덩어리다).
+#
+# float 은 json 의 shortest-round-trip repr 이라 float64 무손실.
+# 마스크 키가 없는 줄도 유효하다 — 그 경우 반응표면이 측정치로 형상을 합성한다.
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _mask_to_runs(mask: np.ndarray) -> dict:
+    """boolean 마스크 → {"shape", "runs"} (행 단위 run-length, 무손실)."""
+    mask = np.asarray(mask, dtype=bool)
+    if mask.ndim != 2:
+        raise ValueError(f"마스크는 2차원이어야 함: {mask.shape}")
+    h, w = mask.shape
+    # 행마다 양옆을 0 으로 패딩 → run 이 행 경계를 넘지 않고, 시작/끝이 1:1
+    pad = np.zeros((h, w + 2), dtype=np.int16)
+    pad[:, 1:-1] = mask
+    d = np.diff(pad.ravel())
+    s = np.flatnonzero(d == 1) + 1
+    e = np.flatnonzero(d == -1) + 1
+    rows = (s // (w + 2)).tolist()
+    cols = (s % (w + 2) - 1).tolist()
+    lens = (e - s).tolist()
+    return {"shape": [h, w],
+            "runs": [[r, c, ln] for r, c, ln in zip(rows, cols, lens)]}
+
+
+def _runs_to_mask(enc: dict) -> np.ndarray:
+    """{"shape", "runs"} → boolean 마스크."""
+    h, w = (int(v) for v in enc["shape"])
+    m = np.zeros((h, w), dtype=bool)
+    for r, c0, ln in enc["runs"]:
+        if not (0 <= r < h and 0 <= c0 and c0 + ln <= w and ln > 0):
+            raise ValueError(f"run 이 형상 {h}x{w} 을 벗어남: {[r, c0, ln]}")
+        m[r, c0:c0 + ln] = True
+    return m
+
+
+def save_observations(path, X, Y, block=None, masks=None,
+                      append: bool = False) -> None:
+    """관측을 obs.jsonl 로 쓴다 (마스크 포함, 한 파일).
+
+    Args:
+        X      : (n, 30) 정수
+        Y      : (n, 6) float — 열 순서 = OBJECTIVE_NAMES
+        block  : (n,) 설계 블록 라벨 (선택)
+        masks  : {"mask1": (n,G,G) bool, "mask2": ...} (선택)
+        append : True 면 이어쓴다. 관측이 늘어나도 전체 재작성이 없다.
+    """
+    import json
+    from pathlib import Path
+
+    path = Path(path)
+    X = np.atleast_2d(np.asarray(X, dtype=np.int64))
+    Y = np.atleast_2d(np.asarray(Y, dtype=np.float64))
+    if len(X) != len(Y):
+        raise ValueError(f"X {len(X)} 행 ≠ Y {len(Y)} 행")
+    if Y.shape[1] != len(OBJECTIVE_NAMES):
+        raise ValueError(f"Y 는 {len(OBJECTIVE_NAMES)}열이어야 함: {Y.shape}")
+    if not np.isfinite(Y).all():
+        raise ValueError("Y 에 비유한값 — 결측은 호출자가 먼저 처리할 것")
+    blk = ["" for _ in X] if block is None else [str(b) for b in block]
+    if len(blk) != len(X):
+        raise ValueError(f"block 길이 {len(blk)} ≠ 관측 수 {len(X)}")
+    if masks is not None:
+        for key in ("mask1", "mask2"):
+            if len(masks[key]) != len(X):
+                raise ValueError(f"{key} {len(masks[key])}개 ≠ 관측 {len(X)}개")
+
+    base = 0
+    if append and path.exists():
+        with path.open() as fh:
+            base = sum(1 for line in fh if line.strip())
+    with path.open("a" if append else "w") as fh:
+        for i in range(len(X)):
+            rec = {"i": base + i, "block": blk[i],
+                   "X": X[i].tolist(), "Y": Y[i].tolist()}
+            if masks is not None:
+                rec["mask1"] = _mask_to_runs(masks["mask1"][i])
+                rec["mask2"] = _mask_to_runs(masks["mask2"][i])
+            fh.write(json.dumps(rec) + "\n")
+
+
+def load_observations(path) -> dict:
+    """obs.jsonl → {"X", "Y", "block", "mask1", "mask2"}.
+
+    마스크가 한 줄이라도 빠져 있으면 mask1/mask2 는 None 이다 (일부만 있는
+    상태는 어느 관측의 형상인지 밀릴 수 있어 받지 않는다 — 즉시 raise).
+    """
+    import json
+    from pathlib import Path
+
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"관측 파일 없음: {path}")
+    X, Y, blk, m1, m2 = [], [], [], [], []
+    with path.open() as fh:
+        for ln, line in enumerate(fh):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError as e:
+                raise ValueError(f"{path}:{ln + 1} JSON 파싱 실패 — {e}") from e
+            X.append(rec["X"])
+            Y.append(rec["Y"])
+            blk.append(rec.get("block", ""))
+            if ("mask1" in rec) != ("mask2" in rec):
+                raise ValueError(f"{path}:{ln + 1} 마스크가 한 장만 있음")
+            if "mask1" in rec:
+                m1.append(_runs_to_mask(rec["mask1"]))
+                m2.append(_runs_to_mask(rec["mask2"]))
+    if not X:
+        raise ValueError(f"{path}: 관측이 0개")
+    if m1 and len(m1) != len(X):
+        raise ValueError(
+            f"{path}: 마스크가 {len(m1)}/{len(X)} 줄에만 있음 — 전부 있거나 전부 없어야 함")
+    return {"X": np.asarray(X, dtype=np.int64),
+            "Y": np.asarray(Y, dtype=np.float64),
+            "block": np.asarray(blk),
+            "mask1": np.array(m1) if m1 else None,
+            "mask2": np.array(m2) if m2 else None}
 
 
 class NoDataError(RuntimeError):
@@ -230,25 +367,17 @@ class SurfaceCalculator:
     # ─── 생성/저장 ─────────────────────────────────────────────────────────
 
     @classmethod
-    def from_npz(cls, path, **kwargs) -> "SurfaceCalculator":
-        """npz 에서 로드. 키: X, Y (+ 선택 mask1, mask2 — uint8 (n,G,G))."""
-        from pathlib import Path
+    def from_jsonl(cls, path, **kwargs) -> "SurfaceCalculator":
+        """obs.jsonl 에서 로드 (`load_observations` 형식)."""
+        d = load_observations(path)
+        masks = None if d["mask1"] is None else {"mask1": d["mask1"],
+                                                 "mask2": d["mask2"]}
+        return cls(d["X"], d["Y"], masks, **kwargs)
 
-        z = np.load(Path(path))
-        masks = None
-        if "mask1" in z and "mask2" in z:
-            masks = {"mask1": z["mask1"].astype(bool), "mask2": z["mask2"].astype(bool)}
-        return cls(z["X"], z["Y"], masks, **kwargs)
-
-    def save_npz(self, path) -> None:
-        """관측을 npz 로 저장 (마스크 원형이 있으면 uint8 로 함께)."""
-        from pathlib import Path
-
-        payload = {"X": self._X, "Y": self._Y}
-        if self._masks is not None:
-            payload["mask1"] = self._masks["mask1"].astype(np.uint8)
-            payload["mask2"] = self._masks["mask2"].astype(np.uint8)
-        np.savez_compressed(Path(path), **payload)
+    def save_jsonl(self, path, block=None, append: bool = False) -> None:
+        """관측을 obs.jsonl 로 저장 (마스크 원형이 있으면 함께)."""
+        save_observations(path, self._X, self._Y, block=block,
+                          masks=self._masks, append=append)
 
     # ─── 거리 ──────────────────────────────────────────────────────────────
 
@@ -658,7 +787,7 @@ class SurfaceCalculator:
 def serve_eval(surface_data, exchange_dir, seed: int) -> int:
     """프로세스 분리 실행의 calculator 한 스텝: x.txt 읽기 → 평가 → y_raw.bin.
 
-    surface_data(npz 경로)로 실측 반응표면을 만들어 평가한다. 교환 셸 함수
+    surface_data(obs.jsonl 경로)로 실측 반응표면을 만들어 평가한다. 교환 셸 함수
     (read_x/write_y_raw)는 optimizer 소유라 여기서 지연 import 한다 (모듈 순환
     회피).
 
@@ -676,7 +805,7 @@ def serve_eval(surface_data, exchange_dir, seed: int) -> int:
 
     d = Path(exchange_dir)
     X, eval_index = read_x(d / "x.txt", space=SearchSpace())
-    calc = SurfaceCalculator.from_npz(surface_data, noise_seed=seed)
+    calc = SurfaceCalculator.from_jsonl(surface_data, noise_seed=seed)
     calc._noise_rng = np.random.default_rng([seed, eval_index])
     raw = calc.evaluate(X)  # 구조화 관측 원형
     write_y_raw(d / "y_raw.bin", raw, eval_index=eval_index)
@@ -697,9 +826,8 @@ if __name__ == "__main__":
     _ap.add_argument("--seed", type=int, default=0)
     _ap.add_argument("--surface-selfcheck", action="store_true",
                      help="SurfaceCalculator(모킹 반응표면) 자가 점검")
-    _ap.add_argument("--surface-data", type=str, default=None, metavar="NPZ",
-                     help="실측 관측 npz (키: X, Y [, mask1, mask2]) — "
-                          "--serve-eval 에 필수")
+    _ap.add_argument("--surface-data", type=str, default=None, metavar="JSONL",
+                     help="실측 관측 obs.jsonl — --serve-eval 에 필수")
     _args = _ap.parse_args()
 
     if _args.surface_selfcheck:
@@ -874,6 +1002,37 @@ if __name__ == "__main__":
         except NoDataError as e:
             print(f"[요구2] strict 모드 차단 OK — {str(e)[:60]}…")
 
+        # ── 파일 형식: obs.jsonl 왕복 + append 가 무손실인가
+        import tempfile
+        from pathlib import Path as _P
+
+        with tempfile.TemporaryDirectory() as _td:
+            f = _P(_td) / "obs.jsonl"
+            save_observations(f, X_obs, Y_obs, block=["t"] * len(X_obs),
+                              masks=masks_obs)
+            back = load_observations(f)
+            assert np.array_equal(back["X"], X_obs), "X 왕복 불일치"
+            assert np.array_equal(back["Y"], Y_obs), "Y 왕복 불일치 (float64 무손실 실패)"
+            assert np.array_equal(back["mask1"], masks_obs["mask1"]), "mask1 왕복 불일치"
+            assert np.array_equal(back["mask2"], masks_obs["mask2"]), "mask2 왕복 불일치"
+            n0 = len(X_obs)
+            save_observations(f, X_obs[:5], Y_obs[:5], block=["u"] * 5,
+                              masks={k: v[:5] for k, v in masks_obs.items()},
+                              append=True)
+            g2 = load_observations(f)
+            assert len(g2["X"]) == n0 + 5 and np.array_equal(g2["X"][:n0], X_obs), \
+                "append 가 기존 관측을 훼손"
+            assert np.array_equal(g2["mask1"][n0:], masks_obs["mask1"][:5]), \
+                "append 된 마스크 불일치"
+            kb = f.stat().st_size / 1e3
+            print(f"[형식] obs.jsonl 왕복 무손실 (X·Y·마스크 전부), "
+                  f"append {n0}→{n0 + 5}줄, {kb:.0f} KB")
+            # 마스크 없는 줄도 유효해야 한다
+            f2 = _P(_td) / "nomask.jsonl"
+            save_observations(f2, X_obs[:3], Y_obs[:3])
+            assert load_observations(f2)["mask1"] is None, "마스크 없는 파일 처리 실패"
+            print("[형식] 마스크 없는 obs.jsonl 도 유효 (표면이 측정치로 합성)")
+
         # ── 검증 (1)(2) 용 리포트
         surf.evaluate(far[:50])
         print(f"[report] {surf.report()}")
@@ -895,4 +1054,4 @@ if __name__ == "__main__":
     print("이 모듈의 calculator 는 SurfaceCalculator (실측 반응표면) 하나다.")
     print("  자가 점검 : python calculator.py --surface-selfcheck")
     print("  분리 평가 : python calculator.py --serve-eval "
-          "--surface-data obs.npz --dir xchg/")
+          "--surface-data obs.jsonl --dir xchg/")
