@@ -44,7 +44,41 @@
 
 ## 현재 상태
 
-루트는 비어 있고 (백지에서 새로 짠다), 과거 자산은 `archive/` 에 참고용으로 둔다.
+### 1. 누적 관리 — 완료
+
+| 파일 | 책임 |
+|---|---|
+| `space.py` | 탐색 공간 명세 (30컬럼 signed 정수 · 블록 구조). 기존 repo 그대로 |
+| `record.py` | **저장 형식** — `obs.jsonl` 한 줄 = 한 측정. RLE blob 2장 + 스칼라 2개 |
+| `score.py` | **점수 정의** — raw → 목적값. 교체 가능 (`area` / `extent` / `area+extent`) |
+| `ingest.py` | **머지** — 측정 파일 디렉토리 → `obs.jsonl` (멱등). reader 이음새 |
+
+```bash
+python ingest.py --check measurements/m0001.npz    # reader 계약부터 확인
+python ingest.py --src measurements/ --out data/obs.jsonl
+python ingest.py --out data/obs.jsonl --validate
+```
+
+설계 결정 세 가지:
+
+- **raw 만 저장하고 y 는 저장하지 않는다.** 점수 정의(면적 ↔ max 폭·높이)는
+  언제든 바뀐다. y 를 파일에 넣으면 바뀌는 순간 전부 stale 이 된다. 지표는
+  RLE 에서 바로 계산되므로(200점 × 8목적 재채점 12ms) 전량 재채점이 공짜다.
+- **마스크 shape 를 줄마다 기록한다.** 두 장은 **서로 크기가 다르다**. 전역
+  격자 상수 하나로 가정하면 그 자리에서 깨진다. 측정끼리의 일관성은
+  `validate()` 가 검사한다.
+- **원본 형식은 reader 이음새 하나로 격리한다.** `read_npz` 가 참고 구현이고,
+  실제 형식에 맞는 함수를 채워 `register()` 하면 하류 전부가 그대로 돈다.
+  `--check` 로 머지 전에 계약을 확인한다.
+
+### 다음
+
+2. pseudo-반응표면 (surrogate) — **optimizer 전략을 정하고 착수**
+3. optimizer 연결
+
+### 참고 자산
+
+과거 자산은 `archive/` 에 참고용으로 둔다.
 
 | | |
 |---|---|

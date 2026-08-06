@@ -1,7 +1,9 @@
 __pycache__/
 *.pyc
-results_full_run.log
-rerun.log
-matrix.log
+
+# 실측 데이터는 커밋하지 않는다 (원본 형식 비공개)
+data/
+measurements/
+*.jsonl
+
 results/
-vis/
