@@ -30,7 +30,7 @@ from pathlib import Path
 
 import numpy as np
 
-from record import N_SCALARS, Blob, Record
+from record import Blob, Record
 from space import SearchSpace
 
 #: 두 마스크의 격자 — 서로 다르다

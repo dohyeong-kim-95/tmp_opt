@@ -117,6 +117,28 @@ GP-BO 는 이 규모에서 느려 피했다. surrogate 는 `surface.py`, acquisi
   가져오면 한 점의 set1 과 다른 점의 set2 를 붙여도 각 그룹의 성질이 보존된다.
   문제 구조가 실제로 허락하는 조작이다.
 
+### 전체 흐름
+
+```bash
+python ingest.py --check measurements/m0001.npz     # reader 계약 확인
+python ingest.py --src measurements/ --out data/obs.jsonl
+python optimize.py --obs data/obs.jsonl --q 4       # 다음에 잴 X 4점
+# 측정 → measurements/ 에 파일이 늘어남 → 다시 ingest → 다시 optimize
+```
+
+각 모듈은 자가 점검을 내장한다: `python record.py` / `score.py` / `sim.py` /
+`surface.py` / `ingest.py --selfcheck` / `optimize.py --selfcheck`.
+
+### 실측 데이터에 붙일 때 해야 할 일
+
+1. `ingest.read_npz` 를 본떠 원본 형식을 읽는 함수를 짜고 `register()` 한다.
+   `--check <파일>` 로 계약부터 확인할 것.
+2. `sim.py` 는 지우지 말고 두되 실측 경로에는 쓰지 않는다 (검증 전용).
+3. **반복측정을 걸 것.** 노이즈 바닥은 여기서만 나오고, 그게 없으면 σ 의 하한이
+   추정치로 대체된다. 한 X 에 몰지 않고 서로 다른 X 에 2회씩 나눠도 dof 가 쌓인다.
+4. `optimize.py` 가 찍는 `report()` 경고를 매번 읽을 것 — 캘리브레이션이
+   질의 거리를 못 덮으면 σ 는 외삽이고, 그때는 `--alpha` 로 직접 올려 잡는다.
+
 ### 참고 자산
 
 과거 자산은 `archive/` 에 참고용으로 둔다.

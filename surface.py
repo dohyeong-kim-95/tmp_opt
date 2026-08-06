@@ -64,7 +64,6 @@ from dataclasses import dataclass
 import numpy as np
 
 import score
-from record import Record
 from space import SearchSpace
 
 #: 후보를 한 번에 이만큼씩 끊어 거리 계산 (acquisition 이 수만 점을 넣는다)
