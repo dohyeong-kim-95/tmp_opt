@@ -4,10 +4,4 @@ results_full_run.log
 rerun.log
 matrix.log
 results/
-obs.jsonl
-*.npz
-xchg/
-ckpt/
-run_obs.jsonl
-obs.state.pkl
-*.state.pkl
+vis/
