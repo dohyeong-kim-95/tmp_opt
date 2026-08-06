@@ -154,8 +154,10 @@ class Surface:
         self._models = self._fit_models(np.arange(self.n))
         self.alpha = 1.0 if alpha is None else float(alpha)
         self._loo_cache: dict | None = None
+        self._replay_floor = np.zeros(self.n_obj)
         if alpha is None and calibrate:
             self.alpha = self._calibrate()
+        self._replay_floor = self._compute_replay_floor()
 
     # ─── 생성 ──────────────────────────────────────────────────────────────
 
@@ -330,13 +332,52 @@ class Surface:
                 exact = full_eq[i, rows].all()
                 for j in js:
                     mu[i, j] = self.Y[rows, j].mean()
-                    # 반복측정이 많을수록 평균의 불확실성이 줄어든다
-                    sigma[i, j] = max(self.noise[j] / np.sqrt(len(rows)), 1e-12)
+                    sigma[i, j] = self._replay_sigma(rows, j)
                     status[i, j] = "exact" if exact else "exact_block"
                     d_min[i, j] = 0.0
                     ham[i, j] = 0.0
 
         return mu, sigma, status, d_min, ham
+
+    def _replay_sigma(self, rows: np.ndarray, j: int) -> float:
+        """관측을 재생할 때의 σ. **0 을 내지 않는다.**
+
+        σ=0 은 "이 점은 완벽히 안다" 는 주장이다. TRUE 표면에 노이즈가 있는 한
+        그건 거짓이고, acquisition 은 그 점을 무한히 신뢰해 버린다(EI 가 그
+        방향으로 붕괴한다). 그래서 근거 세 가지 중 가장 큰 것을 쓴다:
+
+          · 전역 노이즈 바닥 (반복측정 pooled) — 있으면 이게 정답이다
+          · 이 자리에서 겹친 관측들의 산포 — 근거가 2개 이상이면 국소 추정치다
+          · `_replay_floor` — 위 둘이 다 없을 때의 마지노선. 노이즈를 못 쟀다면
+            모델의 LOO 오차보다 정확하다고 주장할 근거가 없다
+
+        마지막으로 근거 개수로 나눈다 (평균의 표준오차).
+        """
+        var = self.noise[j] ** 2
+        if len(rows) >= 2:
+            var = max(var, float(self.Y[rows, j].var(ddof=1)))
+        var = max(var, float(self._replay_floor[j]) ** 2)
+        return float(np.sqrt(var / len(rows)))
+
+    def _compute_replay_floor(self) -> np.ndarray:
+        """반복측정이 없을 때 재생 σ 의 마지노선 (목적별).
+
+        임의의 상수를 박지 않고 데이터에서 뽑는다 — LOO 절대오차의 평균을
+        정규분포의 std 로 환산한 값(×1.2533)이다. "모델이 실제로 내는 오차보다
+        더 정확하다고 주장하지 않는다" 는 뜻. LOO 조차 없으면 관측 산포를 쓴다
+        (아무것도 모른다는 뜻이므로 가장 보수적인 값).
+        """
+        if self.noise_dof > 0:
+            return np.zeros(self.n_obj)      # 진짜 노이즈 추정이 있으면 불필요
+        lo = self._loo()
+        if not lo.get("n"):
+            return self.y_scale.copy()
+        floor = self.y_scale.copy()
+        for j in range(self.n_obj):
+            m = lo["obj"] == j
+            if m.any():
+                floor[j] = float(np.abs(lo["resid"][m]).mean()) * np.sqrt(np.pi / 2)
+        return floor
 
     # ─── 캘리브레이션 ──────────────────────────────────────────────────────
 
@@ -432,6 +473,8 @@ class Surface:
             "noise_rel": dict(zip(self.scorer.names,
                                   (self.noise / self.y_scale).round(4))),
             "noise_dof": self.noise_dof,
+            "replay_floor": dict(zip(self.scorer.names,
+                                     np.round(self._replay_floor, 6))),
             "noise_ci_x": [round(v, 2) for v in self.noise_ci()],
             "d_ref": round(self.d_ref, 5),
             "alpha": round(self.alpha, 4),
@@ -500,8 +543,11 @@ class Surface:
             warn.append("LOO 불가 — 관측이 너무 적어 σ 크기를 검증하지 못했다")
 
         if self.n_repeat_groups == 0:
-            warn.append("반복측정 없음 — 노이즈 바닥을 못 재서 σ 의 하한이 0 이다. "
-                        "같은 X 를 두어 번 재면 표면 전체가 정직해진다")
+            warn.append(
+                "반복측정 없음 — 노이즈 바닥을 못 쟀다. 재생 σ 는 LOO 오차에서 뽑은 "
+                f"마지노선({np.round(self._replay_floor / self.y_scale, 3).tolist()} "
+                "× 관측 산포)으로 대신하고 있다. 같은 X 를 두어 번 재면 이 자리가 "
+                "실측으로 바뀌고 표면 전체가 정직해진다")
         elif self.noise_ci()[1] > 1.5:
             lo_x, hi_x = self.noise_ci()
             warn.append(
