@@ -18,7 +18,7 @@ reset** 한다.
     from score import SCORERS
     sc = SCORERS["area"]()
     Y = sc(records)              # (n, sc.n_obj) float64
-    sc.names, sc.senses          # ("area1","area2","s1","s2"), (+1,+1,−1,−1)
+    sc.names, sc.senses, sc.groups   # 이름 / 방향(+1 max, −1 min) / 블록 그룹(1|2)
 
 자가 점검:
     python score.py
@@ -32,19 +32,27 @@ from record import N_SCALARS, Record
 
 
 class Scorer:
-    """raw → 목적값. 하위 클래스는 `names`/`senses`/`_row` 만 정의한다."""
+    """raw → 목적값. 하위 클래스는 `names`/`senses`/`groups`/`_row` 만 정의한다."""
 
     #: 목적 이름 — 하류가 이것만 보고 돌아야 한다
     names: tuple[str, ...] = ()
     #: +1 최대화 / −1 최소화, `names` 와 같은 길이
     senses: tuple[int, ...] = ()
+    #: 각 목적이 속한 블록 그룹 (1 또는 2) — 1번은 common+set1, 2번은 common+set2
+    #: 에만 의존한다. 반응표면이 목적별로 **무관 컬럼을 빼고** 학습·거리계산하는
+    #: 근거다. 관측이 수십 점일 때 무관 컬럼 15개를 넣고 빼고는 차이가 크다.
+    groups: tuple[int, ...] = ()
 
     def __init_subclass__(cls, **kw) -> None:
         super().__init_subclass__(**kw)
-        if len(cls.names) != len(cls.senses):
-            raise TypeError(f"{cls.__name__}: names 와 senses 길이가 다름")
+        if not (len(cls.names) == len(cls.senses) == len(cls.groups)):
+            raise TypeError(
+                f"{cls.__name__}: names/senses/groups 길이가 다름 — "
+                f"{len(cls.names)}/{len(cls.senses)}/{len(cls.groups)}")
         if not set(cls.senses) <= {1, -1}:
             raise TypeError(f"{cls.__name__}: senses 는 +1 / −1 만 허용")
+        if not set(cls.groups) <= {1, 2}:
+            raise TypeError(f"{cls.__name__}: groups 는 1 / 2 만 허용")
 
     @property
     def n_obj(self) -> int:
@@ -64,8 +72,8 @@ class Scorer:
         return Y
 
     def describe(self) -> str:
-        return "  ".join(f"{n}{'↑' if s > 0 else '↓'}"
-                         for n, s in zip(self.names, self.senses))
+        return "  ".join(f"{n}{'↑' if s > 0 else '↓'}(g{g})"
+                         for n, s, g in zip(self.names, self.senses, self.groups))
 
 
 class AreaScorer(Scorer):
@@ -77,6 +85,7 @@ class AreaScorer(Scorer):
 
     names = ("area1", "area2", "s1", "s2")
     senses = (1, 1, -1, -1)
+    groups = (1, 2, 1, 2)
 
     def _row(self, r: Record) -> list[float]:
         return [r.blobs[0].area, r.blobs[1].area, *r.scalars]
@@ -91,6 +100,7 @@ class ExtentScorer(Scorer):
 
     names = ("h1", "w1", "s1", "h2", "w2", "s2")
     senses = (1, 1, -1, 1, 1, -1)
+    groups = (1, 1, 1, 2, 2, 2)
 
     def _row(self, r: Record) -> list[float]:
         b1, b2 = r.blobs
@@ -107,6 +117,7 @@ class AreaExtentScorer(Scorer):
 
     names = ("area1", "h1", "w1", "s1", "area2", "h2", "w2", "s2")
     senses = (1, 1, 1, -1, 1, 1, 1, -1)
+    groups = (1, 1, 1, 1, 2, 2, 2, 2)
 
     def _row(self, r: Record) -> list[float]:
         b1, b2 = r.blobs
@@ -171,10 +182,13 @@ if __name__ == "__main__":
     # 방향 규약 — 하류가 senses 만 보고 돌 수 있어야 한다
     for name in SCORERS:
         sc = get(name)
-        assert len(sc.names) == len(sc.senses) == sc.n_obj
-        assert set(sc.senses) <= {1, -1}
+        assert len(sc.names) == len(sc.senses) == len(sc.groups) == sc.n_obj
+        assert set(sc.senses) <= {1, -1} and set(sc.groups) <= {1, 2}
+        # 이름의 1/2 접미사와 선언된 그룹이 어긋나면 표면이 엉뚱한 컬럼을 본다
+        for nm, g in zip(sc.names, sc.groups):
+            assert nm.endswith(str(g)), f"{nm} 의 그룹 선언 {g} 이 이름과 어긋남"
         assert sum(1 for s in sc.senses if s < 0) == N_SCALARS, "스칼라는 최소화 목적"
-    print("[OK] names/senses 규약 — 스칼라 2개가 모두 최소화 방향")
+    print("[OK] names/senses/groups 규약 — 스칼라 2개 최소화, 그룹이 이름과 일치")
 
     # 정의 교체 비용 — 전량 재채점이 사실상 공짜여야 raw-only 저장이 성립한다
     t0 = time.perf_counter()
